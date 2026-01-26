@@ -15,6 +15,7 @@ interface SlackMessage {
 export class SlackClient {
   private app: App;
   private claudeExecutor: ClaudeExecutor;
+  private processedEvents: Set<string> = new Set(); // 重複排除用
 
   constructor() {
     this.app = new App({
@@ -44,6 +45,20 @@ export class SlackClient {
 
       // 型キャスト
       const msg = message as SlackMessage;
+
+      // 重複イベント排除（tsをキーに）
+      const eventKey = `${msg.channel}-${msg.ts}`;
+      if (this.processedEvents.has(eventKey)) {
+        console.log(`[DUPLICATE] Ignoring already processed event: ${eventKey}`);
+        return;
+      }
+      this.processedEvents.add(eventKey);
+
+      // 古いイベントキーを削除（メモリリーク防止、1000件超えたら古いものを削除）
+      if (this.processedEvents.size > 1000) {
+        const firstKey = this.processedEvents.values().next().value;
+        if (firstKey) this.processedEvents.delete(firstKey);
+      }
 
       // subtypeがある場合は無視（システムメッセージなど）
       if ('subtype' in msg && msg.subtype) {
