@@ -118,6 +118,68 @@ npm run build
 npm start
 ```
 
+### 7. 自動起動設定（オプション）
+
+PC起動時に自動で立ち上げるには、launchdを使用する。
+
+#### 7.1 plistファイルを作成
+
+`~/Library/LaunchAgents/com.chihi913.slack-claude-bridge.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.chihi913.slack-claude-bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/node</string>
+        <string>dist/index.js</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/slack-claude-bridge</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/slack-claude-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/slack-claude-bridge.error.log</string>
+</dict>
+</plist>
+```
+
+`/path/to/node` と `/path/to/slack-claude-bridge` は環境に合わせて置き換える。
+
+nodeのパス確認: `which node`
+
+#### 7.2 有効化
+
+```bash
+# ビルド
+npm run build
+
+# 有効化
+launchctl load ~/Library/LaunchAgents/com.chihi913.slack-claude-bridge.plist
+```
+
+#### 7.3 操作コマンド
+
+| 操作 | コマンド |
+|------|----------|
+| 状態確認 | `launchctl list \| grep slack-claude` |
+| 一時停止 | `launchctl stop com.chihi913.slack-claude-bridge` |
+| 開始 | `launchctl start com.chihi913.slack-claude-bridge` |
+| 完全停止 | `launchctl unload ~/Library/LaunchAgents/com.chihi913.slack-claude-bridge.plist` |
+| 再有効化 | `launchctl load ~/Library/LaunchAgents/com.chihi913.slack-claude-bridge.plist` |
+| ログ確認 | `tail -f /tmp/slack-claude-bridge.log` |
+| エラー確認 | `tail -f /tmp/slack-claude-bridge.error.log` |
+
+**注意**: `KeepAlive` が有効なため、「一時停止」しても自動再起動される。
+
 ## 使い方
 
 1. 対象チャンネルでメッセージを投稿

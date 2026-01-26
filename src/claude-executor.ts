@@ -246,6 +246,16 @@ end tell
       try {
         await fs.access(doneMarkerPath);
         await this.delay(500);
+
+        // 最終応答かどうか確認（tool_useがある場合はまだ続く）
+        const isFinal = await this.isFinalResponse(sessionId);
+        if (!isFinal) {
+          console.log(`[WAIT] ${threadTs} - tool_use detected, waiting for final response...`);
+          await this.clearDoneMarker(threadTs);
+          await this.delay(checkInterval);
+          continue;
+        }
+
         const response = await this.getResponseFromJsonl(sessionId);
         await this.clearDoneMarker(threadTs);
         await this.clearCurrentThread();
@@ -283,6 +293,37 @@ end tell
     }
 
     throw new Error('No assistant message found in JSONL');
+  }
+
+  private async isFinalResponse(sessionId: string): Promise<boolean> {
+    const projectDir = this.workingDir.replace(/[\/\.]/g, '-');
+    const jsonlPath = path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
+
+    try {
+      const content = await fs.readFile(jsonlPath, 'utf-8');
+      const lines = content.trim().split('\n');
+
+      // 最後のassistantメッセージを探す
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const entry = JSON.parse(lines[i]);
+          if (entry.type === 'assistant' && entry.message?.content) {
+            // content内にtool_useがあるかチェック
+            const hasToolUse = entry.message.content.some(
+              (c: { type: string }) => c.type === 'tool_use'
+            );
+            // tool_useがある場合はまだ続く（最終応答ではない）
+            return !hasToolUse;
+          }
+        } catch {
+          // JSONパースエラーは無視
+        }
+      }
+    } catch {
+      // ファイル読み込みエラー
+    }
+
+    return false;
   }
 
   private async setCurrentThread(threadTs: string): Promise<void> {
