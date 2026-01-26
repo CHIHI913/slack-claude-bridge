@@ -9,16 +9,49 @@ interface ClaudeResponse {
   session_id: string;
 }
 
+interface SessionData {
+  session_id: string;
+  created_at: string;
+  last_used_at: string;
+}
+
+interface SessionsFile {
+  sessions: Record<string, SessionData>;
+}
+
 const SYSTEM_PROMPT = 'あなたはSlackでの返信案を生成するアシスタントです。日本語で回答してください。構成: 結論 → 理由 → 次アクション。断定しすぎず、提案形式で回答してください。返信案は1つだけ生成してください。';
 
 export class ClaudeExecutor {
   private workingDir: string;
   private timeout: number;
-  private sessions: Map<string, string> = new Map(); // threadTs -> sessionId
+  private sessionsFilePath: string;
+  private sessions: Map<string, SessionData> = new Map();
 
   constructor(workingDir: string = config.claudeWorkingDir, timeout: number = config.claudeTimeout) {
     this.workingDir = workingDir;
     this.timeout = timeout;
+    this.sessionsFilePath = config.sessionsFilePath;
+    this.loadSessions();
+  }
+
+  private async loadSessions(): Promise<void> {
+    try {
+      const data = await fs.readFile(this.sessionsFilePath, 'utf-8');
+      const parsed: SessionsFile = JSON.parse(data);
+      this.sessions = new Map(Object.entries(parsed.sessions));
+      console.log(`[SESSIONS] Loaded ${this.sessions.size} sessions from ${this.sessionsFilePath}`);
+    } catch {
+      console.log(`[SESSIONS] No existing sessions file, starting fresh`);
+      this.sessions = new Map();
+    }
+  }
+
+  private async saveSessions(): Promise<void> {
+    const data: SessionsFile = {
+      sessions: Object.fromEntries(this.sessions),
+    };
+    await fs.writeFile(this.sessionsFilePath, JSON.stringify(data, null, 2));
+    console.log(`[SESSIONS] Saved ${this.sessions.size} sessions to ${this.sessionsFilePath}`);
   }
 
   async executeNew(message: string, threadTs: string): Promise<string> {
@@ -29,7 +62,13 @@ export class ClaudeExecutor {
     const response = await this.runClaudeInTerminal(message, null, threadTs);
 
     // セッションIDを保存
-    this.sessions.set(threadTs, response.session_id);
+    const now = new Date().toISOString();
+    this.sessions.set(threadTs, {
+      session_id: response.session_id,
+      created_at: now,
+      last_used_at: now,
+    });
+    await this.saveSessions();
     console.log(`[SESSION SAVED] ${threadTs} -> ${response.session_id}`);
 
     return response.result;
@@ -40,12 +79,18 @@ export class ClaudeExecutor {
     console.log(`[RESUME SESSION] Thread: ${threadTs}`);
     console.log(`${'='.repeat(60)}`);
 
-    const sessionId = this.sessions.get(threadTs);
-    if (!sessionId) {
+    const sessionData = this.sessions.get(threadTs);
+    if (!sessionData) {
       throw new Error(`Session not found for thread: ${threadTs}`);
     }
 
-    const response = await this.runClaudeInTerminal(message, sessionId, threadTs);
+    const response = await this.runClaudeInTerminal(message, sessionData.session_id, threadTs);
+
+    // last_used_at を更新
+    sessionData.last_used_at = new Date().toISOString();
+    this.sessions.set(threadTs, sessionData);
+    await this.saveSessions();
+
     return response.result;
   }
 
@@ -146,7 +191,8 @@ export class ClaudeExecutor {
   }
 
   getSessionId(threadTs: string): string | null {
-    return this.sessions.get(threadTs) || null;
+    const sessionData = this.sessions.get(threadTs);
+    return sessionData?.session_id || null;
   }
 
   async cleanup(): Promise<void> {

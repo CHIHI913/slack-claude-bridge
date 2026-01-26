@@ -55,7 +55,7 @@
 **責務**: Claude Code CLI の実行 + セッション管理
 
 **主要機能**:
-- セッション管理（インメモリMap: thread_ts → session_id）
+- セッション管理（JSONファイル永続化: thread_ts → session_id）
 - Terminal起動（AppleScript経由）
 - 新規セッション開始: `claude -p "..." --output-format json`
 - セッション再開: `claude -p "..." --resume <session_id> --output-format json`
@@ -64,19 +64,24 @@
 
 ## 3. データ構造
 
-### 3.1 セッション対応表（インメモリ）
+### 3.1 セッション対応表 (sessions.json)
 
-```typescript
-// ClaudeExecutor内のMap
-private sessions: Map<string, string> = new Map();
-// key: thread_ts
-// value: claude_session_id
+```json
+{
+  "sessions": {
+    "<thread_ts>": {
+      "session_id": "<claude_session_id>",
+      "created_at": "2026-01-26T10:00:00.000Z",
+      "last_used_at": "2026-01-26T10:30:00.000Z"
+    }
+  }
+}
 ```
 
 **特徴**:
-- プロセス再起動時にセッション情報は失われる
-- シンプルな実装を優先
-- 永続化が必要な場合はJSONファイル保存を追加可能
+- JSONファイルで永続化
+- プロセス再起動後もセッション継続可能
+- 起動時に自動読み込み、更新時に自動保存
 
 ### 3.2 Claude Code 出力 (--output-format json)
 
@@ -105,7 +110,7 @@ private sessions: Map<string, string> = new Map();
    - AppleScriptでTerminal起動
    - claude -p "..." --output-format json > tmpfile
 4. 一時ファイルをポーリングして結果取得
-5. session_idをインメモリMapに保存
+5. session_idをsessions.jsonに保存
    key: thread_ts (= message.ts)
 6. Slack スレッドに返信案を投稿
 ```
@@ -118,12 +123,13 @@ private sessions: Map<string, string> = new Map();
    - 対象チャンネルか？ → No: 無視
    - bot投稿か？ → Yes: 無視
    - thread_ts あり？ → No: 4.1へ
-3. インメモリMapから session_id 取得
+3. sessions.jsonから session_id 取得
    - 見つからない場合: エラー（新規として扱わない）
 4. Terminal経由でClaude Code再開実行
    - claude -p "..." --resume <session_id> --output-format json > tmpfile
 5. 一時ファイルをポーリングして結果取得
-6. Slack スレッドに返信案を投稿
+6. last_used_atを更新してsessions.jsonに保存
+7. Slack スレッドに返信案を投稿
 ```
 
 ## 5. Claude Code 実行詳細
@@ -214,7 +220,10 @@ const config = {
 
   // Claude
   claudeWorkingDir: process.env.CLAUDE_WORKING_DIR || process.cwd(),
-  claudeTimeout: 120000,  // 2分（デフォルト）
+  claudeTimeout: 300000,  // 5分（デフォルト）
+
+  // Sessions
+  sessionsFilePath: './sessions.json',
 };
 ```
 
@@ -230,6 +239,7 @@ slack-claude-bridge/
 ├── docs/
 │   ├── requirements.md    # 要件定義書
 │   └── design.md          # 設計書
+├── sessions.json          # セッション対応表（自動生成）
 ├── package.json
 ├── tsconfig.json
 └── .env                   # 環境変数
@@ -242,7 +252,7 @@ slack-claude-bridge/
 | 言語 | TypeScript | 型安全、エラー検出 |
 | Slack SDK | @slack/bolt | Socket Mode対応、公式 |
 | プロセス実行 | child_process.exec + AppleScript | Terminal経由で可視化、TTY問題を回避 |
-| 状態管理 | インメモリMap | シンプル、再起動時の消失は許容 |
+| 状態管理 | JSONファイル | 永続化、プロセス再起動後も継続可能 |
 | 出力取得 | 一時ファイル + ポーリング | 非同期実行に対応 |
 
 ## 11. 制限事項・既知の問題
@@ -250,5 +260,4 @@ slack-claude-bridge/
 | 項目 | 内容 |
 |------|------|
 | macOS専用 | AppleScriptを使用するためmacOSでのみ動作 |
-| セッション永続化なし | プロセス再起動でセッション情報が消失 |
 | Terminalが必要 | 実行中にTerminal.appが開く |
