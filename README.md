@@ -1,6 +1,8 @@
 # Slack Claude Bridge
 
-Slackの1スレッドを1つの会話単位とし、Mac上のClaude Codeの同一セッションを再開しながら返信案を生成するBridge。
+Slackの1スレッドを1つの会話単位とし、Mac上のClaude Codeの同一ターミナルセッションを再開しながら返信案を生成するBridge。
+
+ターミナル上でClaudeとのやり取りが可視化される対話モードを採用。
 
 ## セットアップ
 
@@ -52,7 +54,40 @@ Slackの1スレッドを1つの会話単位とし、Mac上のClaude Codeの同�
 - `/invite @アプリ名` を入力
 - チャンネル詳細 → インテグレーション → アプリを追加
 
-### 2. 環境変数設定
+### 2. Claude Code Stop hook 設定
+
+Claude Code の応答完了を検知するため、Stop hook を設定する。
+
+**作業ディレクトリ（CLAUDE_WORKING_DIR）の `.claude/settings.json`** を作成/編集:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/slack-claude-bridge/scripts/on-stop.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`/path/to/slack-claude-bridge` はこのリポジトリの絶対パスに置き換えてください。
+
+### 3. アクセシビリティ権限設定
+
+System Eventsでキーストロークを送信するため、Terminalにアクセシビリティ権限が必要:
+
+1. **システム設定** → **プライバシーとセキュリティ** → **アクセシビリティ**
+2. **Terminal.app** を追加して有効化
+
+### 4. 環境変数設定
 
 ```bash
 cp .env.example .env
@@ -66,13 +101,13 @@ TARGET_CHANNEL_ID=C...
 CLAUDE_WORKING_DIR=/path/to/your/project  # optional
 ```
 
-### 3. 依存関係インストール
+### 5. 依存関係インストール
 
 ```bash
 npm install
 ```
 
-### 4. 起動
+### 6. 起動
 
 ```bash
 # 開発
@@ -86,8 +121,10 @@ npm start
 ## 使い方
 
 1. 対象チャンネルでメッセージを投稿
-2. Bridgeが Claude Code を起動し、返信案をスレッドに投稿
-3. スレッド内で会話を続けると、同じClaudeセッションが維持される
+2. Bridgeが 新しいターミナルウィンドウで Claude Code を起動
+3. ターミナル上でClaudeとのやり取りが見える
+4. 応答完了後、返信案がスレッドに投稿される
+5. スレッド内で会話を続けると、同じターミナルウィンドウでやり取りが継続
 
 ## ディレクトリ構成
 
@@ -97,10 +134,27 @@ slack-claude-bridge/
 │   ├── index.ts           # エントリーポイント
 │   ├── config.ts          # 設定
 │   ├── slack-client.ts    # Slack Bot Client
-│   ├── session-manager.ts # Session Manager
-│   └── claude-executor.ts # Claude Executor
+│   └── claude-executor.ts # Claude Executor + ウィンドウ管理
+├── scripts/
+│   └── on-stop.sh         # Stop hook用スクリプト
+├── docs/
+│   ├── requirements.md    # 要件定義書
+│   └── design.md          # 設計書
 ├── sessions.json          # セッション対応表（自動生成）
 ├── package.json
 ├── tsconfig.json
 └── .env
 ```
+
+## 動作原理
+
+1. **新規スレッド**: 新しいターミナルウィンドウで `claude --dangerously-skip-permissions` を起動
+2. **スレッド内返信**: 既存のターミナルウィンドウにクリップボード経由でメッセージを送信
+3. **応答検知**: Stop hook が完了マーカーファイルを作成
+4. **応答取得**: ターミナル内容の差分から応答を抽出してSlackに投稿
+
+## 制限事項
+
+- macOS専用（AppleScriptを使用）
+- Terminal.appが必要（可視化のため）
+- Stop hook設定が必須

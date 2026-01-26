@@ -21,10 +21,10 @@
 │  ┌─────────────────────────────┐    │
 │  │      Claude Executor        │    │
 │  │                             │    │
-│  │  - セッション管理 (Map)      │    │
+│  │  - ウィンドウ管理 (JSON)     │    │
 │  │  - Terminal起動 (AppleScript)│    │
-│  │  - 一時ファイル経由で出力取得 │    │
-│  │  - session_id 抽出・保存     │    │
+│  │  - Stop hook完了監視        │    │
+│  │  - ターミナル内容差分取得    │    │
 │  └─────────────────────────────┘    │
 └─────────────────────────────────────┘
          │
@@ -32,8 +32,16 @@
 ┌─────────────────────────────────────┐
 │            Terminal.app             │
 │  ┌─────────────────────────────┐    │
-│  │  claude -p "..." > tmpfile   │    │
+│  │  claude (対話モード)         │    │
+│  │  - ウィンドウID管理          │    │
+│  │  - 同一スレッド=同一ウィンドウ │    │
 │  └─────────────────────────────┘    │
+└─────────────────────────────────────┘
+         │
+         ▼ Stop hook
+┌─────────────────────────────────────┐
+│         scripts/on-stop.sh          │
+│  - 完了マーカー作成                  │
 └─────────────────────────────────────┘
 ```
 
@@ -52,15 +60,15 @@
 
 ### 2.2 Claude Executor
 
-**責務**: Claude Code CLI の実行 + セッション管理
+**責務**: Claude Code CLI の対話モード実行 + ウィンドウ管理
 
 **主要機能**:
-- セッション管理（JSONファイル永続化: thread_ts → session_id）
+- ウィンドウ管理（JSONファイル永続化: thread_ts → window_id）
 - Terminal起動（AppleScript経由）
-- 新規セッション開始: `claude -p "..." --output-format json`
-- セッション再開: `claude -p "..." --resume <session_id> --output-format json`
-- 一時ファイル経由での出力取得
-- session_id の抽出・保存
+- 新規セッション: 新しいターミナルウィンドウでclaude起動
+- セッション継続: クリップボード + ペースト方式でメッセージ送信
+- Stop hook監視による応答完了検知
+- ターミナル内容の差分取得
 
 ## 3. データ構造
 
@@ -70,9 +78,10 @@
 {
   "sessions": {
     "<thread_ts>": {
-      "session_id": "<claude_session_id>",
+      "window_id": 12345,
       "created_at": "2026-01-26T10:00:00.000Z",
-      "last_used_at": "2026-01-26T10:30:00.000Z"
+      "last_used_at": "2026-01-26T10:30:00.000Z",
+      "terminal_content_before": "..."
     }
   }
 }
@@ -81,20 +90,15 @@
 **特徴**:
 - JSONファイルで永続化
 - プロセス再起動後もセッション継続可能
-- 起動時に自動読み込み、更新時に自動保存
+- ウィンドウIDでターミナルを特定
 
-### 3.2 Claude Code 出力 (--output-format json)
+### 3.2 Stop hook用ファイル
 
-```json
-{
-  "session_id": "550e8400-e29b-41d4-a716-446655440000",
-  "result": "生成されたテキスト...",
-  "usage": {
-    "input_tokens": 100,
-    "output_tokens": 200
-  }
-}
-```
+| ファイル | 用途 |
+|----------|------|
+| `/tmp/claude_current_thread` | 現在処理中のthread_ts |
+| `/tmp/claude_done_<thread_ts>` | 応答完了マーカー |
+| `/tmp/claude_stop_hook.log` | デバッグログ |
 
 ## 4. 処理フロー
 
@@ -106,13 +110,13 @@
    - 対象チャンネルか？ → No: 無視
    - bot投稿か？ → Yes: 無視
    - thread_ts あり？ → Yes: 4.2へ
-3. Terminal経由でClaude Code新規実行
-   - AppleScriptでTerminal起動
-   - claude -p "..." --output-format json > tmpfile
-4. 一時ファイルをポーリングして結果取得
-5. session_idをsessions.jsonに保存
-   key: thread_ts (= message.ts)
-6. Slack スレッドに返信案を投稿
+3. /tmp/claude_current_thread にthread_tsを書き込み
+4. 新しいターミナルウィンドウを開く（AppleScript）
+5. claude --dangerously-skip-permissions を実行
+6. ウィンドウIDをsessions.jsonに保存
+7. /tmp/claude_done_<thread_ts> を監視
+8. 完了後、ターミナル内容の差分を取得
+9. Slack スレッドに返信案を投稿
 ```
 
 ### 4.2 スレッド内返信
@@ -123,71 +127,96 @@
    - 対象チャンネルか？ → No: 無視
    - bot投稿か？ → Yes: 無視
    - thread_ts あり？ → No: 4.1へ
-3. sessions.jsonから session_id 取得
-   - 見つからない場合: エラー（新規として扱わない）
-4. Terminal経由でClaude Code再開実行
-   - claude -p "..." --resume <session_id> --output-format json > tmpfile
-5. 一時ファイルをポーリングして結果取得
-6. last_used_atを更新してsessions.jsonに保存
-7. Slack スレッドに返信案を投稿
+3. sessions.jsonからwindow_idを取得
+   - 見つからない場合: エラー
+4. /tmp/claude_current_thread にthread_tsを書き込み
+5. 対象ウィンドウをアクティブ化
+6. クリップボード + Cmd+V + Enter でメッセージ送信
+7. /tmp/claude_done_<thread_ts> を監視
+8. 完了後、ターミナル内容の差分を取得
+9. Slack スレッドに返信案を投稿
 ```
 
 ## 5. Claude Code 実行詳細
 
 ### 5.1 実行方式
 
-**Terminal + 一時ファイル方式**を採用:
-1. AppleScriptでTerminal.appを起動
-2. claudeコマンドを実行し、出力を一時ファイルにリダイレクト
-3. "DONE"マーカーを追記して完了を通知
-4. Node.js側で一時ファイルをポーリングして結果を取得
+**対話モード + Stop hook方式**を採用:
+1. AppleScriptでターミナルウィンドウを開く
+2. `claude --dangerously-skip-permissions` で対話モード起動
+3. 同じスレッドでは同じウィンドウにメッセージを送信
+4. Stop hookで応答完了を検知
+5. ターミナル内容の差分から応答を抽出
 
 **理由**:
-- node-ptyがmacOSで動作しない問題を回避
-- Claude CLIがTTYを必要とする場合でも動作
-- 実行中のClaudeの状態がTerminalで可視化される
+- ターミナル上でClaudeとのやり取りが可視化される
+- 同一スレッド=同一セッションの対応が自然
+- 対話の流れが維持される
 
 ### 5.2 新規セッション
 
 ```bash
-claude -p '<user_message>' \
-  --append-system-prompt '<system_prompt>' \
-  --output-format json > /tmp/claude-output-<thread_ts>.json 2>&1
-echo "DONE" >> /tmp/claude-output-<thread_ts>.json
+cd /path/to/working/dir && claude --dangerously-skip-permissions --append-system-prompt '<system_prompt>' '<message>'
 ```
 
-### 5.3 セッション再開
+### 5.3 セッション継続
 
-```bash
-claude -p '<user_message>' \
-  --resume '<session_id>' \
-  --output-format json > /tmp/claude-output-<thread_ts>.json 2>&1
-echo "DONE" >> /tmp/claude-output-<thread_ts>.json
+```applescript
+-- クリップボードにメッセージをセット
+set the clipboard to "<message>"
+
+-- 対象ウィンドウをアクティブ化
+tell application "Terminal"
+    set frontmost of window id <window_id> to true
+end tell
+
+-- ペースト + Enter
+tell application "System Events"
+    tell process "Terminal"
+        keystroke "v" using command down
+        keystroke return
+    end tell
+end tell
 ```
 
-### 5.4 AppleScript実行
+### 5.4 Stop hook設定（前提条件）
 
-```javascript
-const appleScript = `
-  tell application "Terminal"
-    activate
-    do script "${fullCmd}"
-  end tell
-`;
-exec(`osascript -e '${appleScript}'`);
-```
+作業ディレクトリの `.claude/settings.json` に以下を追加:
 
-### 5.5 出力ファイル監視・session_id抽出
-
-```javascript
-// 一時ファイルを1秒間隔でポーリング
-const content = await fs.readFile(outputFile, 'utf-8');
-if (content.includes('DONE')) {
-  const jsonContent = content.replace(/DONE\s*$/, '').trim();
-  const response = JSON.parse(jsonContent);
-  const sessionId = response.session_id;
-  const result = response.result;
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/slack-claude-bridge/scripts/on-stop.sh"
+          }
+        ]
+      }
+    ]
+  }
 }
+```
+
+### 5.5 応答内容の抽出
+
+ターミナル内容の差分から応答を抽出:
+
+```typescript
+// 送信前のターミナル内容を保存
+const terminalContentBefore = await getTerminalContent(windowId);
+
+// メッセージ送信...
+// Stop hook待機...
+
+// 送信後のターミナル内容を取得
+const terminalContentAfter = await getTerminalContent(windowId);
+
+// 差分を抽出
+const response = extractResponse(terminalContentBefore, terminalContentAfter);
 ```
 
 ## 6. Slack投稿フォーマット
@@ -202,12 +231,11 @@ if (content.includes('DONE')) {
 
 | エラー種別 | 対応 |
 |-----------|------|
-| Claude実行タイムアウト | ログ記録、Slack投稿しない |
+| Stop hookタイムアウト | ログ記録、Slack投稿しない |
 | Terminal起動失敗 | ログ記録、Slack投稿しない |
-| JSON解析失敗 | 生テキストを結果として使用 |
-| session_id 取得失敗（スレッド返信時） | エラーログ出力、処理スキップ |
+| ウィンドウID取得失敗 | エラーログ出力、処理スキップ |
+| ターミナル内容取得失敗 | フォールバック（空文字列） |
 | Slack投稿失敗 | ログ記録のみ |
-| 一時ファイル読み込み失敗 | 再試行（ポーリング継続） |
 
 ## 8. 設定項目
 
@@ -234,8 +262,10 @@ slack-claude-bridge/
 ├── src/
 │   ├── index.ts           # エントリーポイント
 │   ├── slack-client.ts    # Slack Bot Client
-│   ├── claude-executor.ts # Claude Executor + Session管理
+│   ├── claude-executor.ts # Claude Executor + ウィンドウ管理
 │   └── config.ts          # 設定
+├── scripts/
+│   └── on-stop.sh         # Stop hook用スクリプト
 ├── docs/
 │   ├── requirements.md    # 要件定義書
 │   └── design.md          # 設計書
@@ -251,13 +281,49 @@ slack-claude-bridge/
 |------|------|------|
 | 言語 | TypeScript | 型安全、エラー検出 |
 | Slack SDK | @slack/bolt | Socket Mode対応、公式 |
-| プロセス実行 | child_process.exec + AppleScript | Terminal経由で可視化、TTY問題を回避 |
+| プロセス実行 | child_process.exec + AppleScript | ウィンドウID管理、可視化 |
 | 状態管理 | JSONファイル | 永続化、プロセス再起動後も継続可能 |
-| 出力取得 | 一時ファイル + ポーリング | 非同期実行に対応 |
+| 応答検知 | Stop hook + ファイル監視 | Claude Code標準機能を活用 |
+| 応答取得 | ターミナル内容差分 | 対話モードの出力を直接取得 |
 
 ## 11. 制限事項・既知の問題
 
 | 項目 | 内容 |
 |------|------|
 | macOS専用 | AppleScriptを使用するためmacOSでのみ動作 |
-| Terminalが必要 | 実行中にTerminal.appが開く |
+| Terminalが必要 | 実行中にTerminal.appが開く（可視化のため） |
+| Stop hook設定必須 | 作業ディレクトリに.claude/settings.jsonの設定が必要 |
+| 同時処理制限 | 複数スレッドの同時処理は順次実行を推奨 |
+
+## 12. 前提条件
+
+### 12.1 Stop hook設定
+
+Claude Code の Stop hook を設定する必要がある。
+
+作業ディレクトリ（CLAUDE_WORKING_DIR）の `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/chihiro/src/github.com/CHIHI913/slack-claude-bridge/scripts/on-stop.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### 12.2 アクセシビリティ権限
+
+System Eventsでキーストロークを送信するため、Terminalにアクセシビリティ権限が必要:
+
+1. システム設定 > プライバシーとセキュリティ > アクセシビリティ
+2. Terminal.app を追加して有効化
