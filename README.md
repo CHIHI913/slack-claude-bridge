@@ -6,14 +6,51 @@ Slackの1スレッドを1つの会話単位とし、Mac上のClaude Codeの同�
 
 ### 1. Slack App 作成
 
-1. [Slack API](https://api.slack.com/apps) で新しいAppを作成
-2. **Socket Mode** を有効化し、App-Level Token を生成（`connections:write` scope）
-3. **OAuth & Permissions** で Bot Token Scopes を追加:
-   - `channels:history`
-   - `chat:write`
-4. **Event Subscriptions** で Subscribe to bot events:
-   - `message.channels`
-5. ワークスペースにインストール
+[Slack API](https://api.slack.com/apps) で新しいAppを作成（From scratch）
+
+#### 1.1 Socket Mode 有効化
+
+**Settings** → **Socket Mode**
+
+1. **Enable Socket Mode** をオンにする
+2. Token Name を入力（例: `socket-token`）
+3. **Generate** をクリック
+4. 表示された `xapp-...` トークンを控える（App-Level Token）
+
+#### 1.2 OAuth & Permissions 設定
+
+**Features** → **OAuth & Permissions** → **Bot Token Scopes**
+
+以下のスコープを追加:
+
+| Scope | 用途 |
+|-------|------|
+| `channels:history` | パブリックチャンネルのメッセージ読み取り |
+| `groups:history` | プライベートチャンネルのメッセージ読み取り |
+| `groups:read` | プライベートチャンネル情報の読み取り |
+| `chat:write` | メッセージ投稿 |
+
+#### 1.3 Event Subscriptions 設定
+
+**Features** → **Event Subscriptions**
+
+1. **Enable Events** をオンにする
+2. **Subscribe to bot events** で以下を追加:
+   - `message.channels`（パブリックチャンネル）
+   - `message.groups`（プライベートチャンネル）
+3. **Save Changes** をクリック
+
+#### 1.4 ワークスペースにインストール
+
+**Settings** → **Install App** → **Install to Workspace**
+
+インストール後、`xoxb-...` トークンを控える（Bot Token）
+
+#### 1.5 Botをチャンネルに招待
+
+対象チャンネルで以下のいずれかを実行:
+- `/invite @アプリ名` を入力
+- チャンネル詳細 → インテグレーション → アプリを追加
 
 ### 2. 環境変数設定
 

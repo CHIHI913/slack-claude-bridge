@@ -11,6 +11,9 @@ dist/
 # Sessions
 sessions.json
 
+# PID file
+.pid
+
 # Logs
 *.log
 

@@ -10,7 +10,7 @@ export const config = {
 
   // Claude
   claudeWorkingDir: process.env.CLAUDE_WORKING_DIR || process.cwd(),
-  claudeTimeout: 120000, // 2分
+  claudeTimeout: 300000, // 5分
 
   // Sessions
   sessionsFilePath: './sessions.json',
