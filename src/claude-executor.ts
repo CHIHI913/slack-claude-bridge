@@ -108,14 +108,20 @@ export class ClaudeExecutor {
       claudeCmd += ` --resume '${sessionId}'`;
     }
 
-    // 出力をファイルに書き込むコマンド
-    const fullCmd = `cd '${this.workingDir}' && ${claudeCmd} > '${outputFile}' 2>&1; echo "DONE" >> '${outputFile}'`;
+    // シェルスクリプトを一時ファイルに書き出して実行（表示をクリーンに）
+    const scriptFile = path.join(os.tmpdir(), `claude-script-${threadTs.replace('.', '-')}.sh`);
+    const scriptContent = `#!/bin/zsh
+cd '${this.workingDir}'
+${claudeCmd} > '${outputFile}' 2>&1
+echo "DONE" >> '${outputFile}'
+`;
+    await fs.writeFile(scriptFile, scriptContent, { mode: 0o755 });
 
-    // AppleScriptでターミナルを開いてコマンド実行
+    // AppleScriptでターミナルを開いてスクリプト実行
     const appleScript = `
       tell application "Terminal"
         activate
-        do script "${fullCmd.replace(/"/g, '\\"')}"
+        do script "'${scriptFile}'"
       end tell
     `;
 
