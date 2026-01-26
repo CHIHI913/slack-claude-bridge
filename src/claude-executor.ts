@@ -63,25 +63,29 @@ export class ClaudeExecutor {
     // 完了マーカーを削除
     await this.clearDoneMarker(threadTs);
 
-    // メッセージをエスケープ
-    const escapedMessage = this.escapeForAppleScript(message);
-    const escapedSystemPrompt = this.escapeForAppleScript(SYSTEM_PROMPT);
+    // 一時シェルスクリプトファイルを作成（エスケープ問題を回避）
+    const sanitizedThreadTs = threadTs.replace('.', '-');
+    const scriptPath = `/tmp/claude-start-${sanitizedThreadTs}.sh`;
+    const scriptContent = `#!/bin/zsh
+cd "${this.workingDir}"
+claude --dangerously-skip-permissions --append-system-prompt "${this.escapeForShell(SYSTEM_PROMPT)}" "${this.escapeForShell(message)}"
+`;
+    await fs.writeFile(scriptPath, scriptContent, { mode: 0o755 });
+    console.log(`[SCRIPT] Created startup script: ${scriptPath}`);
 
-    // 新しいターミナルウィンドウでclaude起動
-    const claudeCmd = `cd '${this.workingDir}' && claude --dangerously-skip-permissions --append-system-prompt '${escapedSystemPrompt}' '${escapedMessage}'`;
-
+    // 新しいターミナルウィンドウでスクリプトを実行
     const appleScript = `
-      tell application "Terminal"
-        activate
-        set newWindow to do script "${this.escapeForAppleScript(claudeCmd)}"
-        set windowId to id of window 1
-        return windowId
-      end tell
-    `;
+tell application "Terminal"
+  activate
+  do script "${scriptPath}"
+  set windowId to id of window 1
+  return windowId
+end tell
+`;
 
-    console.log(`[COMMAND] ${claudeCmd.substring(0, 100)}...`);
+    console.log(`[COMMAND] Executing script: ${scriptPath}`);
 
-    const { stdout } = await execAsync(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`);
+    const { stdout } = await execAsync(`osascript -e '${appleScript}'`);
     const windowId = parseInt(stdout.trim(), 10);
     console.log(`[WINDOW] Created new Terminal window, ID: ${windowId}`);
 
@@ -124,28 +128,31 @@ export class ClaudeExecutor {
     const terminalContentBefore = await this.getTerminalContent(sessionData.window_id);
 
     // クリップボードにメッセージをセットして、ペースト＋Enter
-    const appleScript = `
-      set the clipboard to "${this.escapeForAppleScript(message)}"
+    // 一時AppleScriptファイルを作成（エスケープ問題を回避）
+    const sanitizedThreadTs = threadTs.replace('.', '-');
+    const scriptPath = `/tmp/claude-resume-${sanitizedThreadTs}.scpt`;
+    const appleScript = `set the clipboard to "${this.escapeForAppleScript(message)}"
 
-      tell application "Terminal"
-        activate
-        set frontmost of window id ${sessionData.window_id} to true
-      end tell
+tell application "Terminal"
+  activate
+  set frontmost of window id ${sessionData.window_id} to true
+end tell
 
-      delay 0.3
+delay 0.3
 
-      tell application "System Events"
-        tell process "Terminal"
-          keystroke "v" using command down
-          delay 0.2
-          keystroke return
-        end tell
-      end tell
-    `;
+tell application "System Events"
+  tell process "Terminal"
+    keystroke "v" using command down
+    delay 0.2
+    keystroke return
+  end tell
+end tell
+`;
 
+    await fs.writeFile(scriptPath, appleScript);
     console.log(`[RESUME] Sending message to window ${sessionData.window_id}`);
 
-    await execAsync(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`);
+    await execAsync(`osascript "${scriptPath}"`);
 
     // セッション情報を更新
     sessionData.last_used_at = new Date().toISOString();
@@ -256,10 +263,19 @@ export class ClaudeExecutor {
   }
 
   private escapeForAppleScript(str: string): string {
+    // AppleScriptのダブルクォート内で使用する場合のエスケープ
+    return str
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"');
+  }
+
+  private escapeForShell(str: string): string {
+    // シェルのダブルクォート内で使用する場合のエスケープ
     return str
       .replace(/\\/g, '\\\\')
       .replace(/"/g, '\\"')
-      .replace(/'/g, "'\\''");
+      .replace(/\$/g, '\\$')
+      .replace(/`/g, '\\`');
   }
 
   private delay(ms: number): Promise<void> {
