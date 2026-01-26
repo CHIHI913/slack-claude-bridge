@@ -215,31 +215,82 @@ end tell
   }
 
   private extractResponse(before: string, after: string): string {
-    // 差分を抽出
-    // beforeの末尾以降の内容がClaudeの応答
-    const beforeLines = before.split('\n');
-    const afterLines = after.split('\n');
+    // 制御文字（ANSIエスケープシーケンス）を除去
+    const cleanText = (text: string): string => {
+      return text
+        // ANSIエスケープシーケンスを除去
+        .replace(/\x1B\[[0-9;]*[A-Za-z]/g, '')
+        .replace(/\^\[\[[^\s]*/g, '')
+        // その他の制御文字を除去
+        .replace(/[\x00-\x1F\x7F]/g, (char) => char === '\n' ? '\n' : '');
+    };
 
-    // beforeの最後の行を探して、それ以降を取得
-    let startIndex = 0;
-    if (beforeLines.length > 0) {
-      const lastBeforeLine = beforeLines[beforeLines.length - 1].trim();
-      for (let i = 0; i < afterLines.length; i++) {
-        if (afterLines[i].trim() === lastBeforeLine) {
-          startIndex = i + 1;
+    const cleanedAfter = cleanText(after);
+    const lines = cleanedAfter.split('\n');
+
+    // Claude Codeの応答を抽出
+    // パターン: ❯ <ユーザー入力> の後にClaudeの応答が続く
+    let responseLines: string[] = [];
+    let inResponse = false;
+    let foundUserInput = false;
+
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+
+      // 区切り線をスキップ
+      if (line.match(/^[─━]+$/)) {
+        if (inResponse) {
+          break; // 応答の前の区切り線に到達
         }
+        continue;
+      }
+
+      // プロンプト行（ユーザー入力行）を検出
+      if (line.startsWith('❯')) {
+        if (inResponse) {
+          // 応答の前のユーザー入力に到達、抽出完了
+          break;
+        }
+        foundUserInput = true;
+        continue;
+      }
+
+      // Claude Codeバナーを検出したら終了
+      if (line.includes('Claude Code') || line.includes('▐▛███▜▌')) {
+        break;
+      }
+
+      // ステータスバー行をスキップ
+      if (line.includes('bypass permissions') || line.includes('shift+tab')) {
+        continue;
+      }
+
+      // 空でない行があれば応答として追加
+      if (line && foundUserInput) {
+        inResponse = true;
+        responseLines.unshift(lines[i]);
       }
     }
 
-    const responseLines = afterLines.slice(startIndex);
     let response = responseLines.join('\n').trim();
 
-    // プロンプト行（> など）を除去
-    response = response.replace(/^>\s*/gm, '');
-
-    // 空の場合はフォールバック
+    // 空の場合はシンプルなフォールバック
     if (!response) {
-      response = after.slice(-2000); // 最後の2000文字
+      // 最後の❯行を見つけてその次から取得
+      let lastPromptIndex = -1;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].trim().startsWith('❯')) {
+          lastPromptIndex = i;
+          break;
+        }
+      }
+      if (lastPromptIndex >= 0 && lastPromptIndex < lines.length - 1) {
+        response = lines
+          .slice(lastPromptIndex + 1)
+          .filter((l: string) => !l.trim().match(/^[─━]+$/) && !l.includes('bypass permissions'))
+          .join('\n')
+          .trim();
+      }
     }
 
     console.log(`[RESPONSE] Extracted ${response.length} characters`);
