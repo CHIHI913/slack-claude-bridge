@@ -2,22 +2,24 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { promises as fs } from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import * as crypto from 'crypto';
 import { config } from './config';
 
 const execAsync = promisify(exec);
 
 interface SessionData {
   window_id: number;
+  session_id: string;  // Claude CodeのセッションID（UUID）
   created_at: string;
   last_used_at: string;
-  terminal_content_before: string;
 }
 
 interface SessionsFile {
   sessions: Record<string, SessionData>;
 }
 
-const SYSTEM_PROMPT = 'あなたはSlackでの返信案を生成するアシスタントです。日本語で回答してください。構成: 結論 → 理由 → 次アクション。断定しすぎず、提案形式で回答してください。返信案は1つだけ生成してください。';
+const SYSTEM_PROMPT = '';
 
 export class ClaudeExecutor {
   private workingDir: string;
@@ -37,9 +39,7 @@ export class ClaudeExecutor {
       const data = await fs.readFile(this.sessionsFilePath, 'utf-8');
       const parsed: SessionsFile = JSON.parse(data);
       this.sessions = new Map(Object.entries(parsed.sessions));
-      console.log(`[SESSIONS] Loaded ${this.sessions.size} sessions from ${this.sessionsFilePath}`);
     } catch {
-      console.log(`[SESSIONS] No existing sessions file, starting fresh`);
       this.sessions = new Map();
     }
   }
@@ -49,31 +49,24 @@ export class ClaudeExecutor {
       sessions: Object.fromEntries(this.sessions),
     };
     await fs.writeFile(this.sessionsFilePath, JSON.stringify(data, null, 2));
-    console.log(`[SESSIONS] Saved ${this.sessions.size} sessions to ${this.sessionsFilePath}`);
   }
 
   async executeNew(message: string, threadTs: string): Promise<string> {
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`[NEW SESSION] Thread: ${threadTs}`);
-    console.log(`${'='.repeat(60)}`);
+    console.log(`[NEW] ${threadTs}`);
 
-    // 現在のthread_tsをファイルに書き込み（Stop hook用）
     await this.setCurrentThread(threadTs);
-
-    // 完了マーカーを削除
     await this.clearDoneMarker(threadTs);
 
-    // 一時シェルスクリプトファイルを作成（エスケープ問題を回避）
+    const sessionId = crypto.randomUUID();
     const sanitizedThreadTs = threadTs.replace('.', '-');
     const scriptPath = `/tmp/claude-start-${sanitizedThreadTs}.sh`;
+    const systemPromptArg = SYSTEM_PROMPT ? `--append-system-prompt "${this.escapeForShell(SYSTEM_PROMPT)}"` : '';
     const scriptContent = `#!/bin/zsh
 cd "${this.workingDir}"
-claude --dangerously-skip-permissions --append-system-prompt "${this.escapeForShell(SYSTEM_PROMPT)}" "${this.escapeForShell(message)}"
+claude --dangerously-skip-permissions --session-id "${sessionId}" ${systemPromptArg} "${this.escapeForShell(message)}"
 `;
     await fs.writeFile(scriptPath, scriptContent, { mode: 0o755 });
-    console.log(`[SCRIPT] Created startup script: ${scriptPath}`);
 
-    // 新しいターミナルウィンドウでスクリプトを実行
     const appleScript = `
 tell application "Terminal"
   activate
@@ -83,52 +76,43 @@ tell application "Terminal"
 end tell
 `;
 
-    console.log(`[COMMAND] Executing script: ${scriptPath}`);
-
     const { stdout } = await execAsync(`osascript -e '${appleScript}'`);
     const windowId = parseInt(stdout.trim(), 10);
-    console.log(`[WINDOW] Created new Terminal window, ID: ${windowId}`);
-
-    // ターミナル内容の初期状態を取得
-    await this.delay(500);
-    const terminalContentBefore = await this.getTerminalContent(windowId);
 
     // セッション情報を保存
     const now = new Date().toISOString();
     this.sessions.set(threadTs, {
       window_id: windowId,
+      session_id: sessionId,
       created_at: now,
       last_used_at: now,
-      terminal_content_before: terminalContentBefore,
     });
     await this.saveSessions();
 
     // 応答完了を待機
-    const response = await this.waitForResponse(threadTs, windowId, terminalContentBefore);
+    const response = await this.waitForResponse(threadTs, sessionId);
+    await this.cleanupTempFiles(threadTs);
     return response;
   }
 
   async executeResume(message: string, threadTs: string): Promise<string> {
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`[RESUME SESSION] Thread: ${threadTs}`);
-    console.log(`${'='.repeat(60)}`);
+    console.log(`[RESUME] ${threadTs}`);
 
     const sessionData = this.sessions.get(threadTs);
     if (!sessionData) {
       throw new Error(`Session not found for thread: ${threadTs}`);
     }
 
-    // 現在のthread_tsをファイルに書き込み（Stop hook用）
-    await this.setCurrentThread(threadTs);
+    // ウィンドウが存在するか確認
+    const windowExists = await this.checkWindowExists(sessionData.window_id);
+    if (!windowExists) {
+      console.log(`[RESUME] Window ${sessionData.window_id} not found, reopening session`);
+      return this.executeResumeInNewTerminal(message, threadTs, sessionData.session_id);
+    }
 
-    // 完了マーカーを削除
+    await this.setCurrentThread(threadTs);
     await this.clearDoneMarker(threadTs);
 
-    // 現在のターミナル内容を取得
-    const terminalContentBefore = await this.getTerminalContent(sessionData.window_id);
-
-    // クリップボードにメッセージをセットして、ペースト＋Enter
-    // 一時AppleScriptファイルを作成（エスケープ問題を回避）
     const sanitizedThreadTs = threadTs.replace('.', '-');
     const scriptPath = `/tmp/claude-resume-${sanitizedThreadTs}.scpt`;
     const appleScript = `set the clipboard to "${this.escapeForAppleScript(message)}"
@@ -144,172 +128,200 @@ tell application "System Events"
   tell process "Terminal"
     keystroke "v" using command down
     delay 0.2
-    keystroke return
+    keystroke return using command down
   end tell
 end tell
 `;
 
     await fs.writeFile(scriptPath, appleScript);
-    console.log(`[RESUME] Sending message to window ${sessionData.window_id}`);
 
     await execAsync(`osascript "${scriptPath}"`);
 
     // セッション情報を更新
     sessionData.last_used_at = new Date().toISOString();
-    sessionData.terminal_content_before = terminalContentBefore;
     this.sessions.set(threadTs, sessionData);
     await this.saveSessions();
 
     // 応答完了を待機
-    const response = await this.waitForResponse(threadTs, sessionData.window_id, terminalContentBefore);
+    const response = await this.waitForResponse(threadTs, sessionData.session_id);
+    await this.cleanupTempFiles(threadTs);
     return response;
   }
 
-  private async waitForResponse(threadTs: string, windowId: number, terminalContentBefore: string): Promise<string> {
+  private async executeResumeInNewTerminal(message: string, threadTs: string, sessionId: string): Promise<string> {
+    await this.setCurrentThread(threadTs);
+    await this.clearDoneMarker(threadTs);
+
+    const sanitizedThreadTs = threadTs.replace('.', '-');
+    const scriptPath = `/tmp/claude-resume-new-${sanitizedThreadTs}.sh`;
+    const scriptContent = `#!/bin/zsh
+cd "${this.workingDir}"
+claude --dangerously-skip-permissions --resume "${sessionId}"
+`;
+    await fs.writeFile(scriptPath, scriptContent, { mode: 0o755 });
+
+    // 新しいターミナルでセッション再開
+    const openScript = `
+tell application "Terminal"
+  activate
+  do script "${scriptPath}"
+  set windowId to id of window 1
+  return windowId
+end tell
+`;
+
+    const { stdout } = await execAsync(`osascript -e '${openScript}'`);
+    const windowId = parseInt(stdout.trim(), 10);
+
+    // セッション情報を更新（新しいウィンドウID）
+    const now = new Date().toISOString();
+    this.sessions.set(threadTs, {
+      window_id: windowId,
+      session_id: sessionId,
+      created_at: this.sessions.get(threadTs)?.created_at || now,
+      last_used_at: now,
+    });
+    await this.saveSessions();
+
+    // Claude Codeが起動するまで待機（resumeは起動に時間がかかる）
+    await this.delay(4000);
+
+    // AppleScriptでメッセージを送信
+    const sendScriptPath = `/tmp/claude-send-${sanitizedThreadTs}.scpt`;
+    const sendScript = `set the clipboard to "${this.escapeForAppleScript(message)}"
+
+tell application "Terminal"
+  activate
+  set frontmost of window id ${windowId} to true
+end tell
+
+delay 0.3
+
+tell application "System Events"
+  tell process "Terminal"
+    keystroke "v" using command down
+    delay 0.2
+    keystroke return using command down
+  end tell
+end tell
+`;
+
+    await fs.writeFile(sendScriptPath, sendScript);
+    await execAsync(`osascript "${sendScriptPath}"`);
+
+    // メッセージ送信後にdoneマーカーをクリア（セッション再開時の応答でマーカーが作成されている可能性があるため）
+    await this.clearDoneMarker(threadTs);
+
+    // 応答完了を待機
+    const response = await this.waitForResponse(threadTs, sessionId);
+    await this.cleanupTempFiles(threadTs);
+    return response;
+  }
+
+  private async checkWindowExists(windowId: number): Promise<boolean> {
+    const appleScript = `
+tell application "Terminal"
+  try
+    get window id ${windowId}
+    return true
+  on error
+    return false
+  end try
+end tell
+`;
+    try {
+      const { stdout } = await execAsync(`osascript -e '${appleScript}'`);
+      return stdout.trim() === 'true';
+    } catch {
+      return false;
+    }
+  }
+
+  private async waitForResponse(threadTs: string, sessionId: string): Promise<string> {
     const doneMarkerPath = `/tmp/claude_done_${threadTs.replace('.', '-')}`;
     const startTime = Date.now();
     const checkInterval = 500;
 
-    console.log(`[WAITING] Monitoring ${doneMarkerPath}`);
-
     while (Date.now() - startTime < this.timeout) {
       try {
         await fs.access(doneMarkerPath);
-        console.log(`[DONE] Stop hook triggered for ${threadTs}`);
-
-        // 少し待ってからターミナル内容を取得
-        await this.delay(300);
-
-        // ターミナル内容の差分を取得
-        const terminalContentAfter = await this.getTerminalContent(windowId);
-        const response = this.extractResponse(terminalContentBefore, terminalContentAfter);
-
-        // マーカーを削除
+        await this.delay(500);
+        const response = await this.getResponseFromJsonl(sessionId);
         await this.clearDoneMarker(threadTs);
-
+        await this.clearCurrentThread();
+        console.log(`[DONE] ${threadTs}`);
         return response;
       } catch {
         // マーカーがまだない
       }
-
       await this.delay(checkInterval);
     }
 
     throw new Error(`Timeout waiting for Claude response (${this.timeout}ms)`);
   }
 
-  private async getTerminalContent(windowId: number): Promise<string> {
-    try {
-      const appleScript = `
-        tell application "Terminal"
-          set terminalContent to contents of tab 1 of window id ${windowId}
-          return terminalContent
-        end tell
-      `;
-      const { stdout } = await execAsync(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`);
-      return stdout;
-    } catch (error) {
-      console.error(`[ERROR] Failed to get terminal content: ${error}`);
-      return '';
-    }
-  }
+  private async getResponseFromJsonl(sessionId: string): Promise<string> {
+    const projectDir = this.workingDir.replace(/[\/\.]/g, '-');
+    const jsonlPath = path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
 
-  private extractResponse(before: string, after: string): string {
-    // 制御文字（ANSIエスケープシーケンス）を除去
-    const cleanText = (text: string): string => {
-      return text
-        // ANSIエスケープシーケンスを除去
-        .replace(/\x1B\[[0-9;]*[A-Za-z]/g, '')
-        .replace(/\^\[\[[^\s]*/g, '')
-        // その他の制御文字を除去
-        .replace(/[\x00-\x1F\x7F]/g, (char) => char === '\n' ? '\n' : '');
-    };
-
-    const cleanedAfter = cleanText(after);
-    const lines = cleanedAfter.split('\n');
-
-    // Claude Codeの応答を抽出
-    // パターン: ❯ <ユーザー入力> の後にClaudeの応答が続く
-    let responseLines: string[] = [];
-    let inResponse = false;
-    let foundUserInput = false;
+    const content = await fs.readFile(jsonlPath, 'utf-8');
+    const lines = content.trim().split('\n');
 
     for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-
-      // 区切り線をスキップ
-      if (line.match(/^[─━]+$/)) {
-        if (inResponse) {
-          break; // 応答の前の区切り線に到達
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (entry.type === 'assistant' && entry.message?.content) {
+          const textContent = entry.message.content
+            .filter((c: { type: string }) => c.type === 'text')
+            .map((c: { text: string }) => c.text)
+            .join('\n');
+          if (textContent) return textContent;
         }
-        continue;
-      }
-
-      // プロンプト行（ユーザー入力行）を検出
-      if (line.startsWith('❯')) {
-        if (inResponse) {
-          // 応答の前のユーザー入力に到達、抽出完了
-          break;
-        }
-        foundUserInput = true;
-        continue;
-      }
-
-      // Claude Codeバナーを検出したら終了
-      if (line.includes('Claude Code') || line.includes('▐▛███▜▌')) {
-        break;
-      }
-
-      // ステータスバー行をスキップ
-      if (line.includes('bypass permissions') || line.includes('shift+tab')) {
-        continue;
-      }
-
-      // 空でない行があれば応答として追加
-      if (line && foundUserInput) {
-        inResponse = true;
-        responseLines.unshift(lines[i]);
+      } catch {
+        // JSONパースエラーは無視
       }
     }
 
-    let response = responseLines.join('\n').trim();
-
-    // 空の場合はシンプルなフォールバック
-    if (!response) {
-      // 最後の❯行を見つけてその次から取得
-      let lastPromptIndex = -1;
-      for (let i = lines.length - 1; i >= 0; i--) {
-        if (lines[i].trim().startsWith('❯')) {
-          lastPromptIndex = i;
-          break;
-        }
-      }
-      if (lastPromptIndex >= 0 && lastPromptIndex < lines.length - 1) {
-        response = lines
-          .slice(lastPromptIndex + 1)
-          .filter((l: string) => !l.trim().match(/^[─━]+$/) && !l.includes('bypass permissions'))
-          .join('\n')
-          .trim();
-      }
-    }
-
-    console.log(`[RESPONSE] Extracted ${response.length} characters`);
-    return response;
+    throw new Error('No assistant message found in JSONL');
   }
 
   private async setCurrentThread(threadTs: string): Promise<void> {
     const sanitizedThreadTs = threadTs.replace('.', '-');
     await fs.writeFile('/tmp/claude_current_thread', sanitizedThreadTs);
-    console.log(`[THREAD] Set current thread to ${sanitizedThreadTs}`);
+  }
+
+  private async clearCurrentThread(): Promise<void> {
+    try {
+      await fs.unlink('/tmp/claude_current_thread');
+    } catch {
+      // ファイルが存在しない場合は無視
+    }
   }
 
   private async clearDoneMarker(threadTs: string): Promise<void> {
     const markerPath = `/tmp/claude_done_${threadTs.replace('.', '-')}`;
     try {
       await fs.unlink(markerPath);
-      console.log(`[CLEANUP] Removed done marker ${markerPath}`);
     } catch {
       // マーカーが存在しない場合は無視
+    }
+  }
+
+  private async cleanupTempFiles(threadTs: string): Promise<void> {
+    const sanitizedThreadTs = threadTs.replace('.', '-');
+    const tempFiles = [
+      `/tmp/claude-start-${sanitizedThreadTs}.sh`,
+      `/tmp/claude-resume-${sanitizedThreadTs}.scpt`,
+      `/tmp/claude-resume-new-${sanitizedThreadTs}.sh`,
+      `/tmp/claude-send-${sanitizedThreadTs}.scpt`,
+    ];
+
+    for (const filePath of tempFiles) {
+      try {
+        await fs.unlink(filePath);
+      } catch {
+        // ファイルが存在しない場合は無視
+      }
     }
   }
 

@@ -79,9 +79,9 @@
   "sessions": {
     "<thread_ts>": {
       "window_id": 12345,
+      "session_id": "uuid-v4",
       "created_at": "2026-01-26T10:00:00.000Z",
-      "last_used_at": "2026-01-26T10:30:00.000Z",
-      "terminal_content_before": "..."
+      "last_used_at": "2026-01-26T10:30:00.000Z"
     }
   }
 }
@@ -91,14 +91,26 @@
 - JSONファイルで永続化
 - プロセス再起動後もセッション継続可能
 - ウィンドウIDでターミナルを特定
+- session_idでClaude Codeのセッションを特定（JSONLファイル取得、セッション再開に使用）
 
 ### 3.2 Stop hook用ファイル
 
-| ファイル | 用途 |
-|----------|------|
-| `/tmp/claude_current_thread` | 現在処理中のthread_ts |
-| `/tmp/claude_done_<thread_ts>` | 応答完了マーカー |
-| `/tmp/claude_stop_hook.log` | デバッグログ |
+| ファイル | 用途 | ライフサイクル |
+|----------|------|---------------|
+| `/tmp/claude_current_thread` | 現在処理中のthread_ts | 処理開始時に作成、応答取得後に削除 |
+| `/tmp/claude_done_<thread_ts>` | 応答完了マーカー | Stop hookで作成、応答取得後に削除 |
+| `/tmp/claude_stop_hook.log` | デバッグログ | 永続（手動削除） |
+
+**注意**: `/tmp/claude_current_thread`は応答取得後に削除されるため、Slack経由以外でClaude Codeを使用してもStop hookは何も実行しない。
+
+### 3.3 一時ファイル
+
+| ファイル | 用途 | ライフサイクル |
+|----------|------|---------------|
+| `/tmp/claude-start-<thread_ts>.sh` | 新規セッション起動スクリプト | 応答取得後に削除 |
+| `/tmp/claude-resume-<thread_ts>.scpt` | 既存ウィンドウへのメッセージ送信 | 応答取得後に削除 |
+| `/tmp/claude-resume-new-<thread_ts>.sh` | セッション再開スクリプト | 応答取得後に削除 |
+| `/tmp/claude-send-<thread_ts>.scpt` | セッション再開後のメッセージ送信 | 応答取得後に削除 |
 
 ## 4. 処理フロー
 
@@ -110,13 +122,15 @@
    - 対象チャンネルか？ → No: 無視
    - bot投稿か？ → Yes: 無視
    - thread_ts あり？ → Yes: 4.2へ
-3. /tmp/claude_current_thread にthread_tsを書き込み
-4. 新しいターミナルウィンドウを開く（AppleScript）
-5. claude --dangerously-skip-permissions を実行
-6. ウィンドウIDをsessions.jsonに保存
-7. /tmp/claude_done_<thread_ts> を監視
-8. 完了後、ターミナル内容の差分を取得
-9. Slack スレッドに返信案を投稿
+3. session_id (UUID) を生成
+4. /tmp/claude_current_thread にthread_tsを書き込み
+5. 新しいターミナルウィンドウを開く（AppleScript）
+6. claude --dangerously-skip-permissions --session-id <uuid> を実行
+7. ウィンドウID, session_id をsessions.jsonに保存
+8. /tmp/claude_done_<thread_ts> を監視
+9. 完了後、JSONLファイルから応答を取得
+10. /tmp/claude_current_thread と一時ファイルを削除
+11. Slack スレッドに返信案を投稿
 ```
 
 ### 4.2 スレッド内返信
@@ -127,14 +141,33 @@
    - 対象チャンネルか？ → No: 無視
    - bot投稿か？ → Yes: 無視
    - thread_ts あり？ → No: 4.1へ
-3. sessions.jsonからwindow_idを取得
+3. sessions.jsonからwindow_id, session_idを取得
    - 見つからない場合: エラー
-4. /tmp/claude_current_thread にthread_tsを書き込み
-5. 対象ウィンドウをアクティブ化
-6. クリップボード + Cmd+V + Enter でメッセージ送信
-7. /tmp/claude_done_<thread_ts> を監視
-8. 完了後、ターミナル内容の差分を取得
-9. Slack スレッドに返信案を投稿
+4. ウィンドウが存在するか確認
+   - 存在しない場合: 4.3へ
+5. /tmp/claude_current_thread にthread_tsを書き込み
+6. 対象ウィンドウをアクティブ化
+7. クリップボード + Cmd+V + Cmd+Enter でメッセージ送信
+8. /tmp/claude_done_<thread_ts> を監視
+9. 完了後、JSONLファイルから応答を取得
+10. /tmp/claude_current_thread と一時ファイルを削除
+11. Slack スレッドに返信案を投稿
+```
+
+### 4.3 セッション再開（ターミナルが閉じられた場合）
+
+```
+1. /tmp/claude_current_thread にthread_tsを書き込み
+2. 新しいターミナルウィンドウを開く（AppleScript）
+3. claude --dangerously-skip-permissions --resume <session-id> を実行
+4. 新しいウィンドウIDでsessions.jsonを更新
+5. Claude Code起動完了を待機（4秒）
+6. クリップボード + Cmd+V + Cmd+Enter でメッセージ送信
+7. /tmp/claude_done_<thread_ts> をクリア（resume時のStop hook誤検知対策）
+8. /tmp/claude_done_<thread_ts> を監視
+9. 完了後、JSONLファイルから応答を取得
+10. /tmp/claude_current_thread と一時ファイルを削除
+11. Slack スレッドに返信案を投稿
 ```
 
 ## 5. Claude Code 実行詳細
@@ -156,10 +189,10 @@
 ### 5.2 新規セッション
 
 ```bash
-cd /path/to/working/dir && claude --dangerously-skip-permissions --append-system-prompt '<system_prompt>' '<message>'
+cd /path/to/working/dir && claude --dangerously-skip-permissions --session-id "<uuid>" '<message>'
 ```
 
-### 5.3 セッション継続
+### 5.3 セッション継続（ウィンドウが存在する場合）
 
 ```applescript
 -- クリップボードにメッセージをセット
@@ -170,16 +203,25 @@ tell application "Terminal"
     set frontmost of window id <window_id> to true
 end tell
 
--- ペースト + Enter
+-- ペースト + Cmd+Enter（送信）
 tell application "System Events"
     tell process "Terminal"
         keystroke "v" using command down
-        keystroke return
+        delay 0.2
+        keystroke return using command down
     end tell
 end tell
 ```
 
-### 5.4 Stop hook設定（前提条件）
+### 5.4 セッション再開（ウィンドウが閉じられた場合）
+
+```bash
+cd /path/to/working/dir && claude --dangerously-skip-permissions --resume "<session-id>"
+```
+
+起動後、4秒待機してからAppleScriptでメッセージを送信（5.3と同じ方式）。
+
+### 5.5 Stop hook設定（前提条件）
 
 作業ディレクトリの `.claude/settings.json` に以下を追加:
 
@@ -201,22 +243,29 @@ end tell
 }
 ```
 
-### 5.5 応答内容の抽出
+### 5.6 応答内容の取得
 
-ターミナル内容の差分から応答を抽出:
+Claude CodeのJSONLログファイルから応答を取得:
 
 ```typescript
-// 送信前のターミナル内容を保存
-const terminalContentBefore = await getTerminalContent(windowId);
+// JSONLファイルパス: ~/.claude/projects/<project-dir>/<session-id>.jsonl
+const projectDir = workingDir.replace(/[\/\.]/g, '-');
+const jsonlPath = path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
 
-// メッセージ送信...
-// Stop hook待機...
+// ファイルを読み込み、最新のassistantメッセージを抽出
+const content = await fs.readFile(jsonlPath, 'utf-8');
+const lines = content.trim().split('\n');
 
-// 送信後のターミナル内容を取得
-const terminalContentAfter = await getTerminalContent(windowId);
-
-// 差分を抽出
-const response = extractResponse(terminalContentBefore, terminalContentAfter);
+for (let i = lines.length - 1; i >= 0; i--) {
+  const entry = JSON.parse(lines[i]);
+  if (entry.type === 'assistant' && entry.message?.content) {
+    // textタイプのコンテンツを結合して返す
+    return entry.message.content
+      .filter(c => c.type === 'text')
+      .map(c => c.text)
+      .join('\n');
+  }
+}
 ```
 
 ## 6. Slack投稿フォーマット
@@ -284,7 +333,8 @@ slack-claude-bridge/
 | プロセス実行 | child_process.exec + AppleScript | ウィンドウID管理、可視化 |
 | 状態管理 | JSONファイル | 永続化、プロセス再起動後も継続可能 |
 | 応答検知 | Stop hook + ファイル監視 | Claude Code標準機能を活用 |
-| 応答取得 | ターミナル内容差分 | 対話モードの出力を直接取得 |
+| 応答取得 | JSONLファイル読み取り | Claude Codeのセッションログから確実に取得 |
+| セッション再開 | --resume オプション | ターミナルが閉じられても会話を継続可能 |
 
 ## 11. 制限事項・既知の問題
 

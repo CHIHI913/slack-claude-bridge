@@ -148,10 +148,26 @@ slack-claude-bridge/
 
 ## 動作原理
 
-1. **新規スレッド**: 新しいターミナルウィンドウで `claude --dangerously-skip-permissions` を起動
-2. **スレッド内返信**: 既存のターミナルウィンドウにクリップボード経由でメッセージを送信
-3. **応答検知**: Stop hook が完了マーカーファイルを作成
-4. **応答取得**: ターミナル内容の差分から応答を抽出してSlackに投稿
+1. **新規スレッド**: 新しいターミナルウィンドウで `claude --dangerously-skip-permissions --session-id <uuid>` を起動
+2. **スレッド内返信**: 既存のターミナルウィンドウにクリップボード経由でメッセージを送信（Cmd+Enter）
+3. **ターミナルが閉じられた場合**: `claude --resume <session-id>` で新しいターミナルでセッションを再開
+4. **応答検知**: Stop hook が完了マーカーファイルを作成
+5. **応答取得**: Claude CodeのJSONLログファイルから応答を取得してSlackに投稿
+6. **クリーンアップ**: 一時ファイルを自動削除
+
+## 一時ファイル
+
+処理中に `/tmp` 配下に一時ファイルを作成し、応答取得後に自動削除される。
+
+| ファイル | 用途 |
+|----------|------|
+| `claude_current_thread` | 処理中のthread_ts（応答後削除） |
+| `claude_done_<thread_ts>` | 完了マーカー（応答後削除） |
+| `claude-start-*.sh` | 起動スクリプト（応答後削除） |
+| `claude-resume-*.scpt` | メッセージ送信スクリプト（応答後削除） |
+| `claude_stop_hook.log` | デバッグログ（永続） |
+
+**注意**: `claude_current_thread` は応答取得後に削除されるため、Slack経由以外で直接Claude Codeを使用してもStop hookは何も実行しない（干渉しない）。
 
 ## 制限事項
 
