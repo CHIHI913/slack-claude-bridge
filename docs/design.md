@@ -12,29 +12,29 @@
 ┌─────────────────────────────────────┐
 │           Bridge (Node.js)          │
 │                                     │
-│  ┌─────────────┐  ┌──────────────┐  │
-│  │ Slack Bot   │  │ Session      │  │
-│  │ Client      │  │ Manager      │  │
-│  │             │  │              │  │
-│  │ - 受信      │  │ - JSON読書   │  │
-│  │ - 投稿      │  │ - 対応表管理 │  │
-│  └──────┬──────┘  └──────┬───────┘  │
-│         │                │          │
-│         ▼                ▼          │
+│  ┌─────────────────────────────┐    │
+│  │       Slack Bot Client      │    │
+│  │   - 受信 / 投稿             │    │
+│  └──────────────┬──────────────┘    │
+│                 │                   │
+│                 ▼                   │
 │  ┌─────────────────────────────┐    │
 │  │      Claude Executor        │    │
 │  │                             │    │
-│  │  - claude -p "..." 実行     │    │
-│  │  - --resume で再開          │    │
-│  │  - session_id 抽出          │    │
+│  │  - セッション管理 (Map)      │    │
+│  │  - Terminal起動 (AppleScript)│    │
+│  │  - 一時ファイル経由で出力取得 │    │
+│  │  - session_id 抽出・保存     │    │
 │  └─────────────────────────────┘    │
 └─────────────────────────────────────┘
          │
-         ▼ spawn / exec
-┌─────────────────┐
-│  Claude Code    │
-│  (CLI)          │
-└─────────────────┘
+         ▼ AppleScript → Terminal
+┌─────────────────────────────────────┐
+│            Terminal.app             │
+│  ┌─────────────────────────────┐    │
+│  │  claude -p "..." > tmpfile   │    │
+│  └─────────────────────────────┘    │
+└─────────────────────────────────────┘
 ```
 
 ## 2. コンポーネント設計
@@ -50,41 +50,33 @@
 - `message` イベントをフィルタリング
 - スレッドへの返信投稿
 
-### 2.2 Session Manager
+### 2.2 Claude Executor
 
-**責務**: thread_ts ↔ session_id の対応管理
-
-**主要機能**:
-- 対応表の読み込み・保存（JSON）
-- session_id の登録・取得
-- 古いセッションのクリーンアップ（オプション）
-
-### 2.3 Claude Executor
-
-**責務**: Claude Code CLI の実行
+**責務**: Claude Code CLI の実行 + セッション管理
 
 **主要機能**:
+- セッション管理（インメモリMap: thread_ts → session_id）
+- Terminal起動（AppleScript経由）
 - 新規セッション開始: `claude -p "..." --output-format json`
 - セッション再開: `claude -p "..." --resume <session_id> --output-format json`
-- session_id の抽出
-- 結果テキストの抽出
+- 一時ファイル経由での出力取得
+- session_id の抽出・保存
 
 ## 3. データ構造
 
-### 3.1 セッション対応表 (sessions.json)
+### 3.1 セッション対応表（インメモリ）
 
-```json
-{
-  "sessions": {
-    "<thread_ts>": {
-      "session_id": "<claude_session_id>",
-      "channel_id": "<channel_id>",
-      "created_at": "2026-01-26T10:00:00.000Z",
-      "last_used_at": "2026-01-26T10:30:00.000Z"
-    }
-  }
-}
+```typescript
+// ClaudeExecutor内のMap
+private sessions: Map<string, string> = new Map();
+// key: thread_ts
+// value: claude_session_id
 ```
+
+**特徴**:
+- プロセス再起動時にセッション情報は失われる
+- シンプルな実装を優先
+- 永続化が必要な場合はJSONファイル保存を追加可能
 
 ### 3.2 Claude Code 出力 (--output-format json)
 
@@ -109,11 +101,12 @@
    - 対象チャンネルか？ → No: 無視
    - bot投稿か？ → Yes: 無視
    - thread_ts あり？ → Yes: 4.2へ
-3. Claude Code 新規実行
-   claude -p "<メッセージ>" --output-format json
-4. レスポンスから session_id 抽出
-5. sessions.json に保存
-   key: message.ts (= thread_ts として扱う)
+3. Terminal経由でClaude Code新規実行
+   - AppleScriptでTerminal起動
+   - claude -p "..." --output-format json > tmpfile
+4. 一時ファイルをポーリングして結果取得
+5. session_idをインメモリMapに保存
+   key: thread_ts (= message.ts)
 6. Slack スレッドに返信案を投稿
 ```
 
@@ -125,41 +118,70 @@
    - 対象チャンネルか？ → No: 無視
    - bot投稿か？ → Yes: 無視
    - thread_ts あり？ → No: 4.1へ
-3. sessions.json から session_id 取得
-   - 見つからない場合: 新規セッションとして扱う
-4. Claude Code 再開実行
-   claude -p "<メッセージ>" --resume <session_id> --output-format json
-5. last_used_at を更新
+3. インメモリMapから session_id 取得
+   - 見つからない場合: エラー（新規として扱わない）
+4. Terminal経由でClaude Code再開実行
+   - claude -p "..." --resume <session_id> --output-format json > tmpfile
+5. 一時ファイルをポーリングして結果取得
 6. Slack スレッドに返信案を投稿
 ```
 
 ## 5. Claude Code 実行詳細
 
-### 5.1 新規セッション
+### 5.1 実行方式
+
+**Terminal + 一時ファイル方式**を採用:
+1. AppleScriptでTerminal.appを起動
+2. claudeコマンドを実行し、出力を一時ファイルにリダイレクト
+3. "DONE"マーカーを追記して完了を通知
+4. Node.js側で一時ファイルをポーリングして結果を取得
+
+**理由**:
+- node-ptyがmacOSで動作しない問題を回避
+- Claude CLIがTTYを必要とする場合でも動作
+- 実行中のClaudeの状態がTerminalで可視化される
+
+### 5.2 新規セッション
 
 ```bash
-claude -p "<user_message>" \
-  --output-format json \
-  --append-system-prompt "あなたはSlackでの返信案を生成するアシスタントです。
-日本語で回答してください。
-構成: 結論 → 理由 → 次アクション
-断定しすぎず、提案形式で回答してください。"
+claude -p '<user_message>' \
+  --append-system-prompt '<system_prompt>' \
+  --output-format json > /tmp/claude-output-<thread_ts>.json 2>&1
+echo "DONE" >> /tmp/claude-output-<thread_ts>.json
 ```
 
-### 5.2 セッション再開
+### 5.3 セッション再開
 
 ```bash
-claude -p "<user_message>" \
-  --resume "<session_id>" \
-  --output-format json
+claude -p '<user_message>' \
+  --resume '<session_id>' \
+  --output-format json > /tmp/claude-output-<thread_ts>.json 2>&1
+echo "DONE" >> /tmp/claude-output-<thread_ts>.json
 ```
 
-### 5.3 session_id 抽出
+### 5.4 AppleScript実行
 
 ```javascript
-const output = JSON.parse(stdout);
-const sessionId = output.session_id;
-const result = output.result;
+const appleScript = `
+  tell application "Terminal"
+    activate
+    do script "${fullCmd}"
+  end tell
+`;
+exec(`osascript -e '${appleScript}'`);
+```
+
+### 5.5 出力ファイル監視・session_id抽出
+
+```javascript
+// 一時ファイルを1秒間隔でポーリング
+const content = await fs.readFile(outputFile, 'utf-8');
+if (content.includes('DONE')) {
+  const jsonContent = content.replace(/DONE\s*$/, '').trim();
+  const response = JSON.parse(jsonContent);
+  const sessionId = response.session_id;
+  const result = response.result;
+}
 ```
 
 ## 6. Slack投稿フォーマット
@@ -175,10 +197,11 @@ const result = output.result;
 | エラー種別 | 対応 |
 |-----------|------|
 | Claude実行タイムアウト | ログ記録、Slack投稿しない |
-| Claude実行エラー | ログ記録、Slack投稿しない |
-| session_id 取得失敗 | 新規セッションとして再試行 |
-| Slack投稿失敗 | ログ記録、リトライ（1回） |
-| sessions.json 読み込み失敗 | 空の状態で初期化 |
+| Terminal起動失敗 | ログ記録、Slack投稿しない |
+| JSON解析失敗 | 生テキストを結果として使用 |
+| session_id 取得失敗（スレッド返信時） | エラーログ出力、処理スキップ |
+| Slack投稿失敗 | ログ記録のみ |
+| 一時ファイル読み込み失敗 | 再試行（ポーリング継続） |
 
 ## 8. 設定項目
 
@@ -191,10 +214,7 @@ const config = {
 
   // Claude
   claudeWorkingDir: process.env.CLAUDE_WORKING_DIR || process.cwd(),
-  claudeTimeout: 120000,  // 2分
-
-  // Sessions
-  sessionsFilePath: './sessions.json',
+  claudeTimeout: 120000,  // 2分（デフォルト）
 };
 ```
 
@@ -205,10 +225,11 @@ slack-claude-bridge/
 ├── src/
 │   ├── index.ts           # エントリーポイント
 │   ├── slack-client.ts    # Slack Bot Client
-│   ├── session-manager.ts # Session Manager
-│   ├── claude-executor.ts # Claude Executor
+│   ├── claude-executor.ts # Claude Executor + Session管理
 │   └── config.ts          # 設定
-├── sessions.json          # セッション対応表
+├── docs/
+│   ├── requirements.md    # 要件定義書
+│   └── design.md          # 設計書
 ├── package.json
 ├── tsconfig.json
 └── .env                   # 環境変数
@@ -220,5 +241,14 @@ slack-claude-bridge/
 |------|------|------|
 | 言語 | TypeScript | 型安全、エラー検出 |
 | Slack SDK | @slack/bolt | Socket Mode対応、公式 |
-| プロセス実行 | child_process.spawn | ストリーム対応 |
-| 状態管理 | JSON file | シンプル、要件に合致 |
+| プロセス実行 | child_process.exec + AppleScript | Terminal経由で可視化、TTY問題を回避 |
+| 状態管理 | インメモリMap | シンプル、再起動時の消失は許容 |
+| 出力取得 | 一時ファイル + ポーリング | 非同期実行に対応 |
+
+## 11. 制限事項・既知の問題
+
+| 項目 | 内容 |
+|------|------|
+| macOS専用 | AppleScriptを使用するためmacOSでのみ動作 |
+| セッション永続化なし | プロセス再起動でセッション情報が消失 |
+| Terminalが必要 | 実行中にTerminal.appが開く |
