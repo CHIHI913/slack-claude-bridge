@@ -98,6 +98,7 @@ export class SlackClient {
       questions,
       answers: {},
       answerIndices: {},
+      confirmed: {},
       createdAt: Date.now(),
     });
 
@@ -276,7 +277,7 @@ export class SlackClient {
             const answers = pending.answers[q.question];
             if (q.multiSelect) {
               // multiSelectは「選択完了」ボタンで確定
-              return answers && answers.length > 0 && (pending as { confirmed?: Record<string, boolean> }).confirmed?.[q.question];
+              return answers && answers.length > 0 && pending.confirmed[q.question];
             }
             return answers && answers.length > 0;
           });
@@ -334,9 +335,7 @@ export class SlackClient {
         }
 
         // この質問を確定済みとしてマーク
-        (pending as { confirmed?: Record<string, boolean> }).confirmed =
-          (pending as { confirmed?: Record<string, boolean> }).confirmed || {};
-        (pending as { confirmed?: Record<string, boolean> }).confirmed![question.question] = true;
+        pending.confirmed[question.question] = true;
 
         console.log(`[CONFIRM] ${threadTs} - Confirmed: "${question.question}" = [${selected.join(', ')}]`);
 
@@ -345,7 +344,7 @@ export class SlackClient {
           const answers = pending.answers[q.question];
           if (!answers || answers.length === 0) return false;
           if (q.multiSelect) {
-            return (pending as { confirmed?: Record<string, boolean> }).confirmed?.[q.question] === true;
+            return pending.confirmed[q.question] === true;
           }
           return true;
         });
@@ -357,7 +356,7 @@ export class SlackClient {
             const answers = pending.answers[q.question];
             if (!answers || answers.length === 0) return true;
             if (q.multiSelect) {
-              return !(pending as { confirmed?: Record<string, boolean> }).confirmed?.[q.question];
+              return !pending.confirmed[q.question];
             }
             return false;
           }).length;
