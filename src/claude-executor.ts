@@ -1,13 +1,10 @@
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { config } from './config';
+import { AppleScriptBuilder } from './applescript-builder';
 import type { WaitResult, AskUserQuestionToolUse, AnswerSelection } from './types';
-
-const execAsync = promisify(exec);
 
 interface SessionData {
   window_id: number;
@@ -27,11 +24,13 @@ export class ClaudeExecutor {
   private timeout: number;
   private sessionsFilePath: string;
   private sessions: Map<string, SessionData> = new Map();
+  private appleScript: AppleScriptBuilder;
 
   constructor(workingDir: string = config.claudeWorkingDir, timeout: number = config.claudeTimeout) {
     this.workingDir = workingDir;
     this.timeout = timeout;
     this.sessionsFilePath = config.sessionsFilePath;
+    this.appleScript = new AppleScriptBuilder();
     this.loadSessions();
   }
 
@@ -59,26 +58,18 @@ export class ClaudeExecutor {
     await this.clearDoneMarker(threadTs);
 
     const sessionId = crypto.randomUUID();
-    const sanitizedThreadTs = threadTs.replace('.', '-');
+    const sanitizedThreadTs = this.sanitizeThreadTs(threadTs);
     const scriptPath = `/tmp/claude-start-${sanitizedThreadTs}.sh`;
-    const systemPromptArg = SYSTEM_PROMPT ? `--append-system-prompt "${this.escapeForShell(SYSTEM_PROMPT)}"` : '';
+    const systemPromptArg = SYSTEM_PROMPT ? `--append-system-prompt "${this.appleScript.escapeForShell(SYSTEM_PROMPT)}"` : '';
     const scriptContent = `#!/bin/zsh
 cd "${this.workingDir}"
-claude --dangerously-skip-permissions --session-id "${sessionId}" ${systemPromptArg} "${this.escapeForShell(message)}"
+claude --dangerously-skip-permissions --session-id "${sessionId}" ${systemPromptArg} "${this.appleScript.escapeForShell(message)}"
 `;
     await fs.writeFile(scriptPath, scriptContent, { mode: 0o755 });
 
-    const appleScript = `
-tell application "Terminal"
-  activate
-  do script "${scriptPath}"
-  set windowId to id of window 1
-  return windowId
-end tell
-`;
-
-    const { stdout } = await execAsync(`osascript -e '${appleScript}'`);
-    const windowId = parseInt(stdout.trim(), 10);
+    const openScript = this.appleScript.buildOpenTerminalScript(scriptPath);
+    const windowIdStr = await this.appleScript.executeInline(openScript);
+    const windowId = parseInt(windowIdStr, 10);
 
     // セッション情報を保存
     const now = new Date().toISOString();
@@ -107,7 +98,7 @@ end tell
     }
 
     // ウィンドウが存在するか確認
-    const windowExists = await this.checkWindowExists(sessionData.window_id);
+    const windowExists = await this.appleScript.checkWindowExists(sessionData.window_id);
     if (!windowExists) {
       console.log(`[RESUME] Window ${sessionData.window_id} not found, reopening session`);
       return this.executeResumeInNewTerminal(message, threadTs, sessionData.session_id);
@@ -116,29 +107,13 @@ end tell
     await this.setCurrentThread(threadTs);
     await this.clearDoneMarker(threadTs);
 
-    const sanitizedThreadTs = threadTs.replace('.', '-');
+    const sanitizedThreadTs = this.sanitizeThreadTs(threadTs);
     const scriptPath = `/tmp/claude-resume-${sanitizedThreadTs}.scpt`;
-    const appleScript = `set the clipboard to "${this.escapeForAppleScript(message)}"
+    const script = this.appleScript.buildClipboardPasteScript(sessionData.window_id, message);
 
-tell application "Terminal"
-  activate
-  set frontmost of window id ${sessionData.window_id} to true
-end tell
+    await fs.writeFile(scriptPath, script);
 
-delay 0.3
-
-tell application "System Events"
-  tell process "Terminal"
-    keystroke "v" using command down
-    delay 0.2
-    keystroke return using command down
-  end tell
-end tell
-`;
-
-    await fs.writeFile(scriptPath, appleScript);
-
-    await execAsync(`osascript "${scriptPath}"`);
+    await this.appleScript.executeFile(scriptPath);
 
     // セッション情報を更新
     sessionData.last_used_at = new Date().toISOString();
@@ -157,7 +132,7 @@ end tell
     await this.setCurrentThread(threadTs);
     await this.clearDoneMarker(threadTs);
 
-    const sanitizedThreadTs = threadTs.replace('.', '-');
+    const sanitizedThreadTs = this.sanitizeThreadTs(threadTs);
     const scriptPath = `/tmp/claude-resume-new-${sanitizedThreadTs}.sh`;
     const scriptContent = `#!/bin/zsh
 cd "${this.workingDir}"
@@ -166,17 +141,9 @@ claude --dangerously-skip-permissions --resume "${sessionId}"
     await fs.writeFile(scriptPath, scriptContent, { mode: 0o755 });
 
     // 新しいターミナルでセッション再開
-    const openScript = `
-tell application "Terminal"
-  activate
-  do script "${scriptPath}"
-  set windowId to id of window 1
-  return windowId
-end tell
-`;
-
-    const { stdout } = await execAsync(`osascript -e '${openScript}'`);
-    const windowId = parseInt(stdout.trim(), 10);
+    const openScript = this.appleScript.buildOpenTerminalScript(scriptPath);
+    const windowIdStr = await this.appleScript.executeInline(openScript);
+    const windowId = parseInt(windowIdStr, 10);
 
     // セッション情報を更新（新しいウィンドウID）
     const now = new Date().toISOString();
@@ -193,26 +160,10 @@ end tell
 
     // AppleScriptでメッセージを送信
     const sendScriptPath = `/tmp/claude-send-${sanitizedThreadTs}.scpt`;
-    const sendScript = `set the clipboard to "${this.escapeForAppleScript(message)}"
-
-tell application "Terminal"
-  activate
-  set frontmost of window id ${windowId} to true
-end tell
-
-delay 0.3
-
-tell application "System Events"
-  tell process "Terminal"
-    keystroke "v" using command down
-    delay 0.2
-    keystroke return using command down
-  end tell
-end tell
-`;
+    const sendScript = this.appleScript.buildClipboardPasteScript(windowId, message);
 
     await fs.writeFile(sendScriptPath, sendScript);
-    await execAsync(`osascript "${sendScriptPath}"`);
+    await this.appleScript.executeFile(sendScriptPath);
 
     // メッセージ送信後にdoneマーカーをクリア（セッション再開時の応答でマーカーが作成されている可能性があるため）
     await this.clearDoneMarker(threadTs);
@@ -223,25 +174,6 @@ end tell
       await this.cleanupTempFiles(threadTs);
     }
     return result;
-  }
-
-  private async checkWindowExists(windowId: number): Promise<boolean> {
-    const appleScript = `
-tell application "Terminal"
-  try
-    get window id ${windowId}
-    return true
-  on error
-    return false
-  end try
-end tell
-`;
-    try {
-      const { stdout } = await execAsync(`osascript -e '${appleScript}'`);
-      return stdout.trim() === 'true';
-    } catch {
-      return false;
-    }
   }
 
   private async waitForResponse(threadTs: string, sessionId: string): Promise<WaitResult> {
@@ -295,8 +227,7 @@ end tell
   }
 
   private async getResponseFromJsonl(sessionId: string): Promise<string> {
-    const projectDir = this.workingDir.replace(/[\/\.]/g, '-');
-    const jsonlPath = path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
+    const jsonlPath = this.getJsonlPath(sessionId);
 
     const content = await fs.readFile(jsonlPath, 'utf-8');
     const lines = content.trim().split('\n');
@@ -320,8 +251,7 @@ end tell
   }
 
   private async isFinalResponse(sessionId: string): Promise<boolean> {
-    const projectDir = this.workingDir.replace(/[\/\.]/g, '-');
-    const jsonlPath = path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
+    const jsonlPath = this.getJsonlPath(sessionId);
 
     try {
       const content = await fs.readFile(jsonlPath, 'utf-8');
@@ -355,8 +285,7 @@ end tell
     sessionId: string,
     lastCheckedLine: number = 0
   ): Promise<{ found: boolean; toolUse: AskUserQuestionToolUse | null; lineCount: number }> {
-    const projectDir = this.workingDir.replace(/[\/\.]/g, '-');
-    const jsonlPath = path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
+    const jsonlPath = this.getJsonlPath(sessionId);
 
     try {
       const content = await fs.readFile(jsonlPath, 'utf-8');
@@ -418,15 +347,15 @@ end tell
     }
 
     // ウィンドウが存在するか確認
-    const windowExists = await this.checkWindowExists(sessionData.window_id);
+    const windowExists = await this.appleScript.checkWindowExists(sessionData.window_id);
     if (!windowExists) {
       throw new Error(`Terminal window not found for thread: ${threadTs}`);
     }
 
     await this.clearDoneMarker(threadTs);
 
-    // AppleScriptでキーストロークを送信
-    const sanitizedThreadTs = threadTs.replace('.', '-');
+    // キーストロークを送信
+    const sanitizedThreadTs = this.sanitizeThreadTs(threadTs);
     const scriptPath = `/tmp/claude-answer-${sanitizedThreadTs}.scpt`;
 
     // 各質問に対するキーストロークを生成
@@ -477,23 +406,10 @@ end tell
     keystrokes.push('delay 0.5');
     keystrokes.push('keystroke return');
 
-    const appleScript = `
-tell application "Terminal"
-  activate
-  set frontmost of window id ${sessionData.window_id} to true
-end tell
+    const script = this.appleScript.buildKeystrokeScript(sessionData.window_id, keystrokes);
 
-delay 0.3
-
-tell application "System Events"
-  tell process "Terminal"
-    ${keystrokes.join('\n    ')}
-  end tell
-end tell
-`;
-
-    await fs.writeFile(scriptPath, appleScript);
-    await execAsync(`osascript "${scriptPath}"`);
+    await fs.writeFile(scriptPath, script);
+    await this.appleScript.executeFile(scriptPath);
 
     // 応答完了を待機
     const result = await this.waitForResponse(threadTs, sessionData.session_id);
@@ -513,7 +429,7 @@ end tell
   }
 
   private async setCurrentThread(threadTs: string): Promise<void> {
-    const sanitizedThreadTs = threadTs.replace('.', '-');
+    const sanitizedThreadTs = this.sanitizeThreadTs(threadTs);
     await fs.writeFile('/tmp/claude_current_thread', sanitizedThreadTs);
   }
 
@@ -535,7 +451,7 @@ end tell
   }
 
   private async cleanupTempFiles(threadTs: string): Promise<void> {
-    const sanitizedThreadTs = threadTs.replace('.', '-');
+    const sanitizedThreadTs = this.sanitizeThreadTs(threadTs);
     const tempFiles = [
       `/tmp/claude-start-${sanitizedThreadTs}.sh`,
       `/tmp/claude-resume-${sanitizedThreadTs}.scpt`,
@@ -552,24 +468,17 @@ end tell
     }
   }
 
-  private escapeForAppleScript(str: string): string {
-    // AppleScriptのダブルクォート内で使用する場合のエスケープ
-    return str
-      .replace(/\\/g, '\\\\')
-      .replace(/"/g, '\\"');
-  }
-
-  private escapeForShell(str: string): string {
-    // シェルのダブルクォート内で使用する場合のエスケープ
-    return str
-      .replace(/\\/g, '\\\\')
-      .replace(/"/g, '\\"')
-      .replace(/\$/g, '\\$')
-      .replace(/`/g, '\\`');
-  }
-
   private delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private sanitizeThreadTs(threadTs: string): string {
+    return threadTs.replace('.', '-');
+  }
+
+  private getJsonlPath(sessionId: string): string {
+    const projectDir = this.workingDir.replace(/[\/\.]/g, '-');
+    return path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
   }
 
   hasSession(threadTs: string): boolean {
