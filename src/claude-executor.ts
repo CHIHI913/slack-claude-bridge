@@ -118,23 +118,7 @@ end tell
 
     const sanitizedThreadTs = this.sanitizeThreadTs(threadTs);
     const scriptPath = `/tmp/claude-resume-${sanitizedThreadTs}.scpt`;
-    const appleScript = `set the clipboard to "${this.escapeForAppleScript(message)}"
-
-tell application "Terminal"
-  activate
-  set frontmost of window id ${sessionData.window_id} to true
-end tell
-
-delay 0.3
-
-tell application "System Events"
-  tell process "Terminal"
-    keystroke "v" using command down
-    delay 0.2
-    keystroke return using command down
-  end tell
-end tell
-`;
+    const appleScript = this.buildClipboardPasteScript(sessionData.window_id, message);
 
     await fs.writeFile(scriptPath, appleScript);
 
@@ -193,23 +177,7 @@ end tell
 
     // AppleScriptでメッセージを送信
     const sendScriptPath = `/tmp/claude-send-${sanitizedThreadTs}.scpt`;
-    const sendScript = `set the clipboard to "${this.escapeForAppleScript(message)}"
-
-tell application "Terminal"
-  activate
-  set frontmost of window id ${windowId} to true
-end tell
-
-delay 0.3
-
-tell application "System Events"
-  tell process "Terminal"
-    keystroke "v" using command down
-    delay 0.2
-    keystroke return using command down
-  end tell
-end tell
-`;
+    const sendScript = this.buildClipboardPasteScript(windowId, message);
 
     await fs.writeFile(sendScriptPath, sendScript);
     await execAsync(`osascript "${sendScriptPath}"`);
@@ -576,6 +544,26 @@ end tell
   private getJsonlPath(sessionId: string): string {
     const projectDir = this.workingDir.replace(/[\/\.]/g, '-');
     return path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
+  }
+
+  private buildClipboardPasteScript(windowId: number, message: string): string {
+    return `set the clipboard to "${this.escapeForAppleScript(message)}"
+
+tell application "Terminal"
+  activate
+  set frontmost of window id ${windowId} to true
+end tell
+
+delay 0.3
+
+tell application "System Events"
+  tell process "Terminal"
+    keystroke "v" using command down
+    delay 0.2
+    keystroke return using command down
+  end tell
+end tell
+`;
   }
 
   hasSession(threadTs: string): boolean {

@@ -119,88 +119,22 @@ export class SlackClient {
       const isMultiSelect = q.multiSelect === true;
       const selectedLabels = currentAnswers?.[q.question] || [];
 
-      // 質問ヘッダー（multiSelectの場合は複数選択可能と表示）
-      blocks.push({
-        type: 'section',
-        block_id: `question_${qIndex}_${sanitizedThreadTs}`,
-        text: {
-          type: 'mrkdwn',
-          text: `*${q.header || '質問'}*${isMultiSelect ? '（複数選択可）' : ''}\n${q.question}`,
-        },
-      });
+      // 質問ヘッダー
+      blocks.push(this.buildQuestionHeader(q, qIndex, sanitizedThreadTs, isMultiSelect));
 
       // 選択肢ボタン
       if (q.options && q.options.length > 0) {
-        const elements = q.options.map((opt, optIndex) => {
-          const isSelected = selectedLabels.includes(opt.label);
-          return {
-            type: 'button' as const,
-            text: {
-              type: 'plain_text' as const,
-              text: `${isSelected ? '✓ ' : ''}${opt.label}`.substring(0, 75),
-              emoji: true,
-            },
-            action_id: `ask_user_question_${sanitizedThreadTs}_${qIndex}_${optIndex}`,
-            value: JSON.stringify({
-              threadTs,
-              questionIndex: qIndex,
-              optionIndex: optIndex,
-              label: opt.label,
-              isMultiSelect,
-              optionCount: q.options?.length || 0,
-            }),
-            style: isSelected ? ('primary' as const) : undefined,
-          };
-        });
-
-        blocks.push({
-          type: 'actions',
-          block_id: `options_${qIndex}_${sanitizedThreadTs}`,
-          elements,
-        });
+        blocks.push(this.buildOptionButtons(q, qIndex, threadTs, sanitizedThreadTs, isMultiSelect, selectedLabels));
 
         // multiSelectの場合は「選択完了」ボタンを追加
         if (isMultiSelect) {
-          blocks.push({
-            type: 'actions',
-            block_id: `confirm_${qIndex}_${sanitizedThreadTs}`,
-            elements: [
-              {
-                type: 'button' as const,
-                text: {
-                  type: 'plain_text' as const,
-                  text: '選択完了',
-                  emoji: true,
-                },
-                action_id: `ask_confirm_${sanitizedThreadTs}_${qIndex}`,
-                value: JSON.stringify({
-                  threadTs,
-                  questionIndex: qIndex,
-                  isMultiSelect: true,
-                  optionCount: q.options?.length || 0,
-                }),
-                style: 'primary' as const,
-              },
-            ],
-          });
+          blocks.push(this.buildConfirmButton(q, qIndex, threadTs, sanitizedThreadTs));
         }
 
         // 選択肢の説明を追加
-        const descriptions = q.options
-          .filter(opt => opt.description)
-          .map((opt, i) => `${i + 1}. *${opt.label}*: ${opt.description}`)
-          .join('\n');
-
-        if (descriptions) {
-          blocks.push({
-            type: 'context',
-            elements: [
-              {
-                type: 'mrkdwn',
-                text: descriptions,
-              },
-            ],
-          });
+        const descriptionBlock = this.buildOptionDescriptions(q.options);
+        if (descriptionBlock) {
+          blocks.push(descriptionBlock);
         }
       }
 
@@ -211,6 +145,108 @@ export class SlackClient {
     });
 
     return blocks;
+  }
+
+  private buildQuestionHeader(
+    q: AskUserQuestionItem,
+    qIndex: number,
+    sanitizedThreadTs: string,
+    isMultiSelect: boolean
+  ): KnownBlock {
+    return {
+      type: 'section',
+      block_id: `question_${qIndex}_${sanitizedThreadTs}`,
+      text: {
+        type: 'mrkdwn',
+        text: `*${q.header || '質問'}*${isMultiSelect ? '（複数選択可）' : ''}\n${q.question}`,
+      },
+    };
+  }
+
+  private buildOptionButtons(
+    q: AskUserQuestionItem,
+    qIndex: number,
+    threadTs: string,
+    sanitizedThreadTs: string,
+    isMultiSelect: boolean,
+    selectedLabels: string[]
+  ): KnownBlock {
+    const elements = q.options!.map((opt, optIndex) => {
+      const isSelected = selectedLabels.includes(opt.label);
+      return {
+        type: 'button' as const,
+        text: {
+          type: 'plain_text' as const,
+          text: `${isSelected ? '✓ ' : ''}${opt.label}`.substring(0, 75),
+          emoji: true,
+        },
+        action_id: `ask_user_question_${sanitizedThreadTs}_${qIndex}_${optIndex}`,
+        value: JSON.stringify({
+          threadTs,
+          questionIndex: qIndex,
+          optionIndex: optIndex,
+          label: opt.label,
+          isMultiSelect,
+          optionCount: q.options?.length || 0,
+        }),
+        style: isSelected ? ('primary' as const) : undefined,
+      };
+    });
+
+    return {
+      type: 'actions',
+      block_id: `options_${qIndex}_${sanitizedThreadTs}`,
+      elements,
+    };
+  }
+
+  private buildConfirmButton(
+    q: AskUserQuestionItem,
+    qIndex: number,
+    threadTs: string,
+    sanitizedThreadTs: string
+  ): KnownBlock {
+    return {
+      type: 'actions',
+      block_id: `confirm_${qIndex}_${sanitizedThreadTs}`,
+      elements: [
+        {
+          type: 'button' as const,
+          text: {
+            type: 'plain_text' as const,
+            text: '選択完了',
+            emoji: true,
+          },
+          action_id: `ask_confirm_${sanitizedThreadTs}_${qIndex}`,
+          value: JSON.stringify({
+            threadTs,
+            questionIndex: qIndex,
+            isMultiSelect: true,
+            optionCount: q.options?.length || 0,
+          }),
+          style: 'primary' as const,
+        },
+      ],
+    };
+  }
+
+  private buildOptionDescriptions(options: { label: string; description?: string }[]): KnownBlock | null {
+    const descriptions = options
+      .filter(opt => opt.description)
+      .map((opt, i) => `${i + 1}. *${opt.label}*: ${opt.description}`)
+      .join('\n');
+
+    if (!descriptions) return null;
+
+    return {
+      type: 'context',
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: descriptions,
+        },
+      ],
+    };
   }
 
   private setupActionHandlers(): void {
