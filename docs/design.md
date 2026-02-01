@@ -358,7 +358,7 @@ Claude Code の Stop hook を設定する必要がある。
         "hooks": [
           {
             "type": "command",
-            "command": "/Users/chihiro/src/github.com/CHIHI913/slack-claude-bridge/scripts/on-stop.sh"
+            "command": "/path/to/slack-claude-bridge/scripts/on-stop.sh"
           }
         ]
       }

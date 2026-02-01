@@ -124,7 +124,7 @@ PC起動時に自動で立ち上げるには、launchdを使用する。
 
 #### 7.1 plistファイルを作成
 
-`~/Library/LaunchAgents/com.chihi913.slack-claude-bridge.plist`:
+`~/Library/LaunchAgents/com.example.slack-claude-bridge.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -132,7 +132,7 @@ PC起動時に自動で立ち上げるには、launchdを使用する。
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.chihi913.slack-claude-bridge</string>
+    <string>com.example.slack-claude-bridge</string>
     <key>ProgramArguments</key>
     <array>
         <string>/path/to/node</string>
@@ -163,7 +163,7 @@ nodeのパス確認: `which node`
 npm run build
 
 # 有効化
-launchctl load ~/Library/LaunchAgents/com.chihi913.slack-claude-bridge.plist
+launchctl load ~/Library/LaunchAgents/com.example.slack-claude-bridge.plist
 ```
 
 #### 7.3 操作コマンド
@@ -171,10 +171,10 @@ launchctl load ~/Library/LaunchAgents/com.chihi913.slack-claude-bridge.plist
 | 操作 | コマンド |
 |------|----------|
 | 状態確認 | `launchctl list \| grep slack-claude` |
-| 一時停止 | `launchctl stop com.chihi913.slack-claude-bridge` |
-| 開始 | `launchctl start com.chihi913.slack-claude-bridge` |
-| 完全停止 | `launchctl unload ~/Library/LaunchAgents/com.chihi913.slack-claude-bridge.plist` |
-| 再有効化 | `launchctl load ~/Library/LaunchAgents/com.chihi913.slack-claude-bridge.plist` |
+| 一時停止 | `launchctl stop com.example.slack-claude-bridge` |
+| 開始 | `launchctl start com.example.slack-claude-bridge` |
+| 完全停止 | `launchctl unload ~/Library/LaunchAgents/com.example.slack-claude-bridge.plist` |
+| 再有効化 | `launchctl load ~/Library/LaunchAgents/com.example.slack-claude-bridge.plist` |
 | ログ確認 | `tail -f /tmp/slack-claude-bridge.log` |
 | エラー確認 | `tail -f /tmp/slack-claude-bridge.error.log` |
 
