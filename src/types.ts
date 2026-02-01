@@ -31,8 +31,6 @@ export interface PendingQuestion {
   answers: Record<string, string[]>;  // multiSelect対応で配列に
   // 各質問の選択肢インデックス（0-based）、multiSelectの場合は複数
   answerIndices: Record<string, number[]>;
-  // multiSelectの質問が確定済みかどうか
-  confirmed: Record<string, boolean>;
   createdAt: number;
 }
 

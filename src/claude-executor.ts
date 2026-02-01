@@ -59,7 +59,7 @@ export class ClaudeExecutor {
     await this.clearDoneMarker(threadTs);
 
     const sessionId = crypto.randomUUID();
-    const sanitizedThreadTs = this.sanitizeThreadTs(threadTs);
+    const sanitizedThreadTs = threadTs.replace('.', '-');
     const scriptPath = `/tmp/claude-start-${sanitizedThreadTs}.sh`;
     const systemPromptArg = SYSTEM_PROMPT ? `--append-system-prompt "${this.escapeForShell(SYSTEM_PROMPT)}"` : '';
     const scriptContent = `#!/bin/zsh
@@ -116,7 +116,7 @@ end tell
     await this.setCurrentThread(threadTs);
     await this.clearDoneMarker(threadTs);
 
-    const sanitizedThreadTs = this.sanitizeThreadTs(threadTs);
+    const sanitizedThreadTs = threadTs.replace('.', '-');
     const scriptPath = `/tmp/claude-resume-${sanitizedThreadTs}.scpt`;
     const appleScript = `set the clipboard to "${this.escapeForAppleScript(message)}"
 
@@ -157,7 +157,7 @@ end tell
     await this.setCurrentThread(threadTs);
     await this.clearDoneMarker(threadTs);
 
-    const sanitizedThreadTs = this.sanitizeThreadTs(threadTs);
+    const sanitizedThreadTs = threadTs.replace('.', '-');
     const scriptPath = `/tmp/claude-resume-new-${sanitizedThreadTs}.sh`;
     const scriptContent = `#!/bin/zsh
 cd "${this.workingDir}"
@@ -295,7 +295,8 @@ end tell
   }
 
   private async getResponseFromJsonl(sessionId: string): Promise<string> {
-    const jsonlPath = this.getJsonlPath(sessionId);
+    const projectDir = this.workingDir.replace(/[\/\.]/g, '-');
+    const jsonlPath = path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
 
     const content = await fs.readFile(jsonlPath, 'utf-8');
     const lines = content.trim().split('\n');
@@ -319,7 +320,8 @@ end tell
   }
 
   private async isFinalResponse(sessionId: string): Promise<boolean> {
-    const jsonlPath = this.getJsonlPath(sessionId);
+    const projectDir = this.workingDir.replace(/[\/\.]/g, '-');
+    const jsonlPath = path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
 
     try {
       const content = await fs.readFile(jsonlPath, 'utf-8');
@@ -353,7 +355,8 @@ end tell
     sessionId: string,
     lastCheckedLine: number = 0
   ): Promise<{ found: boolean; toolUse: AskUserQuestionToolUse | null; lineCount: number }> {
-    const jsonlPath = this.getJsonlPath(sessionId);
+    const projectDir = this.workingDir.replace(/[\/\.]/g, '-');
+    const jsonlPath = path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
 
     try {
       const content = await fs.readFile(jsonlPath, 'utf-8');
@@ -423,7 +426,7 @@ end tell
     await this.clearDoneMarker(threadTs);
 
     // AppleScriptでキーストロークを送信
-    const sanitizedThreadTs = this.sanitizeThreadTs(threadTs);
+    const sanitizedThreadTs = threadTs.replace('.', '-');
     const scriptPath = `/tmp/claude-answer-${sanitizedThreadTs}.scpt`;
 
     // 各質問に対するキーストロークを生成
@@ -510,7 +513,7 @@ end tell
   }
 
   private async setCurrentThread(threadTs: string): Promise<void> {
-    const sanitizedThreadTs = this.sanitizeThreadTs(threadTs);
+    const sanitizedThreadTs = threadTs.replace('.', '-');
     await fs.writeFile('/tmp/claude_current_thread', sanitizedThreadTs);
   }
 
@@ -532,7 +535,7 @@ end tell
   }
 
   private async cleanupTempFiles(threadTs: string): Promise<void> {
-    const sanitizedThreadTs = this.sanitizeThreadTs(threadTs);
+    const sanitizedThreadTs = threadTs.replace('.', '-');
     const tempFiles = [
       `/tmp/claude-start-${sanitizedThreadTs}.sh`,
       `/tmp/claude-resume-${sanitizedThreadTs}.scpt`,
@@ -567,15 +570,6 @@ end tell
 
   private delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  private sanitizeThreadTs(threadTs: string): string {
-    return threadTs.replace('.', '-');
-  }
-
-  private getJsonlPath(sessionId: string): string {
-    const projectDir = this.workingDir.replace(/[\/\.]/g, '-');
-    return path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
   }
 
   hasSession(threadTs: string): boolean {
