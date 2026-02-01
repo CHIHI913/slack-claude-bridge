@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { config } from './config';
+import type { WaitResult, AskUserQuestionToolUse, AnswerSelection } from './types';
 
 const execAsync = promisify(exec);
 
@@ -51,7 +52,7 @@ export class ClaudeExecutor {
     await fs.writeFile(this.sessionsFilePath, JSON.stringify(data, null, 2));
   }
 
-  async executeNew(message: string, threadTs: string): Promise<string> {
+  async executeNew(message: string, threadTs: string): Promise<WaitResult> {
     console.log(`[NEW] ${threadTs}`);
 
     await this.setCurrentThread(threadTs);
@@ -90,12 +91,14 @@ end tell
     await this.saveSessions();
 
     // 応答完了を待機
-    const response = await this.waitForResponse(threadTs, sessionId);
-    await this.cleanupTempFiles(threadTs);
-    return response;
+    const result = await this.waitForResponse(threadTs, sessionId);
+    if (result.type === 'final') {
+      await this.cleanupTempFiles(threadTs);
+    }
+    return result;
   }
 
-  async executeResume(message: string, threadTs: string): Promise<string> {
+  async executeResume(message: string, threadTs: string): Promise<WaitResult> {
     console.log(`[RESUME] ${threadTs}`);
 
     const sessionData = this.sessions.get(threadTs);
@@ -143,12 +146,14 @@ end tell
     await this.saveSessions();
 
     // 応答完了を待機
-    const response = await this.waitForResponse(threadTs, sessionData.session_id);
-    await this.cleanupTempFiles(threadTs);
-    return response;
+    const result = await this.waitForResponse(threadTs, sessionData.session_id);
+    if (result.type === 'final') {
+      await this.cleanupTempFiles(threadTs);
+    }
+    return result;
   }
 
-  private async executeResumeInNewTerminal(message: string, threadTs: string, sessionId: string): Promise<string> {
+  private async executeResumeInNewTerminal(message: string, threadTs: string, sessionId: string): Promise<WaitResult> {
     await this.setCurrentThread(threadTs);
     await this.clearDoneMarker(threadTs);
 
@@ -213,9 +218,11 @@ end tell
     await this.clearDoneMarker(threadTs);
 
     // 応答完了を待機
-    const response = await this.waitForResponse(threadTs, sessionId);
-    await this.cleanupTempFiles(threadTs);
-    return response;
+    const result = await this.waitForResponse(threadTs, sessionId);
+    if (result.type === 'final') {
+      await this.cleanupTempFiles(threadTs);
+    }
+    return result;
   }
 
   private async checkWindowExists(windowId: number): Promise<boolean> {
@@ -237,12 +244,29 @@ end tell
     }
   }
 
-  private async waitForResponse(threadTs: string, sessionId: string): Promise<string> {
+  private async waitForResponse(threadTs: string, sessionId: string): Promise<WaitResult> {
     const doneMarkerPath = `/tmp/claude_done_${threadTs.replace('.', '-')}`;
     const startTime = Date.now();
     const checkInterval = 500;
+    let lastCheckedLine = 0;
 
     while (Date.now() - startTime < this.timeout) {
+      // AskUserQuestionの検出（doneマーカーに関係なく常にチェック）
+      const askQuestion = await this.checkForAskUserQuestion(sessionId, lastCheckedLine);
+      if (askQuestion.found) {
+        lastCheckedLine = askQuestion.lineCount;
+        if (askQuestion.toolUse) {
+          console.log(`[ASK] ${threadTs} - AskUserQuestion detected`);
+          return {
+            type: 'ask_user_question',
+            toolUse: askQuestion.toolUse,
+            sessionId: sessionId,
+            threadTs: threadTs,
+          };
+        }
+      }
+
+      // doneマーカーの確認
       try {
         await fs.access(doneMarkerPath);
         await this.delay(500);
@@ -260,7 +284,7 @@ end tell
         await this.clearDoneMarker(threadTs);
         await this.clearCurrentThread();
         console.log(`[DONE] ${threadTs}`);
-        return response;
+        return { type: 'final', text: response };
       } catch {
         // マーカーがまだない
       }
@@ -308,12 +332,13 @@ end tell
         try {
           const entry = JSON.parse(lines[i]);
           if (entry.type === 'assistant' && entry.message?.content) {
-            // content内にtool_useがあるかチェック
-            const hasToolUse = entry.message.content.some(
-              (c: { type: string }) => c.type === 'tool_use'
+            // content内にtool_useがあるかチェック（AskUserQuestion以外）
+            const hasNonAskToolUse = entry.message.content.some(
+              (c: { type: string; name?: string }) =>
+                c.type === 'tool_use' && c.name !== 'AskUserQuestion'
             );
-            // tool_useがある場合はまだ続く（最終応答ではない）
-            return !hasToolUse;
+            // AskUserQuestion以外のtool_useがある場合はまだ続く
+            return !hasNonAskToolUse;
           }
         } catch {
           // JSONパースエラーは無視
@@ -324,6 +349,167 @@ end tell
     }
 
     return false;
+  }
+
+  private async checkForAskUserQuestion(
+    sessionId: string,
+    lastCheckedLine: number = 0
+  ): Promise<{ found: boolean; toolUse: AskUserQuestionToolUse | null; lineCount: number }> {
+    const projectDir = this.workingDir.replace(/[\/\.]/g, '-');
+    const jsonlPath = path.join(os.homedir(), '.claude', 'projects', projectDir, `${sessionId}.jsonl`);
+
+    try {
+      const content = await fs.readFile(jsonlPath, 'utf-8');
+      const lines = content.trim().split('\n');
+      const lineCount = lines.length;
+
+      // 新しい行がなければスキップ
+      if (lineCount <= lastCheckedLine) {
+        return { found: false, toolUse: null, lineCount };
+      }
+
+      // 最後のassistantメッセージを探す（新しい行のみ）
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const entry = JSON.parse(lines[i]);
+
+          // tool_resultがある場合は既に回答済みなのでスキップ
+          if (entry.type === 'user' && entry.message?.content) {
+            const hasToolResult = entry.message.content.some(
+              (c: { type: string }) => c.type === 'tool_result'
+            );
+            if (hasToolResult) {
+              // 既に回答済み
+              return { found: true, toolUse: null, lineCount };
+            }
+          }
+
+          if (entry.type === 'assistant' && entry.message?.content) {
+            // AskUserQuestionのtool_useを探す
+            const askToolUse = entry.message.content.find(
+              (c: { type: string; name?: string }) =>
+                c.type === 'tool_use' && c.name === 'AskUserQuestion'
+            );
+            if (askToolUse) {
+              return { found: true, toolUse: askToolUse as AskUserQuestionToolUse, lineCount };
+            }
+            // 他のassistantメッセージが見つかったら、AskUserQuestionはない
+            return { found: true, toolUse: null, lineCount };
+          }
+        } catch {
+          // JSONパースエラーは無視
+        }
+      }
+    } catch {
+      // ファイル読み込みエラー
+    }
+
+    return { found: false, toolUse: null, lineCount: lastCheckedLine };
+  }
+
+  async sendUserAnswer(threadTs: string, selections: AnswerSelection[]): Promise<WaitResult> {
+    console.log(`[ANSWER] ${threadTs} - Sending selections:`, selections.map(s =>
+      `Q${s.questionIndex}: [${s.selectedIndices.join(',')}] (multiSelect: ${s.isMultiSelect})`
+    ).join(', '));
+
+    const sessionData = this.sessions.get(threadTs);
+    if (!sessionData) {
+      throw new Error(`Session not found for thread: ${threadTs}`);
+    }
+
+    // ウィンドウが存在するか確認
+    const windowExists = await this.checkWindowExists(sessionData.window_id);
+    if (!windowExists) {
+      throw new Error(`Terminal window not found for thread: ${threadTs}`);
+    }
+
+    await this.clearDoneMarker(threadTs);
+
+    // AppleScriptでキーストロークを送信
+    const sanitizedThreadTs = threadTs.replace('.', '-');
+    const scriptPath = `/tmp/claude-answer-${sanitizedThreadTs}.scpt`;
+
+    // 各質問に対するキーストロークを生成
+    const keystrokes: string[] = [];
+    for (const selection of selections) {
+      if (selection.isMultiSelect) {
+        // multiSelect: 各選択肢に移動してスペースキーでチェック
+        // 選択肢のインデックスをソートして順番に処理
+        const sortedIndices = [...selection.selectedIndices].sort((a, b) => a - b);
+        let currentPosition = 0;
+
+        for (const targetIndex of sortedIndices) {
+          // 現在位置から目標位置まで移動
+          const moves = targetIndex - currentPosition;
+          for (let i = 0; i < moves; i++) {
+            keystrokes.push('key code 125'); // 下矢印
+            keystrokes.push('delay 0.1');
+          }
+          // スペースキーでチェック
+          keystrokes.push('keystroke space');
+          keystrokes.push('delay 0.2');
+          currentPosition = targetIndex;
+        }
+
+        // Submit/Next位置まで移動してエンター
+        // 選択肢(0〜optionCount-1) → Type something(optionCount) → Next(optionCount+1)
+        const submitPosition = selection.optionCount + 1;
+        const movesToSubmit = submitPosition - currentPosition;
+        for (let i = 0; i < movesToSubmit; i++) {
+          keystrokes.push('key code 125'); // 下矢印
+          keystrokes.push('delay 0.1');
+        }
+        keystrokes.push('keystroke return');
+        keystrokes.push('delay 0.3');
+      } else {
+        // 単一選択: 下矢印で移動してエンター
+        const index = selection.selectedIndices[0] || 0;
+        for (let i = 0; i < index; i++) {
+          keystrokes.push('key code 125'); // 下矢印
+          keystrokes.push('delay 0.1');
+        }
+        keystrokes.push('keystroke return');
+        keystrokes.push('delay 0.3');
+      }
+    }
+
+    // 最後にSubmit確認画面でエンターを押す
+    keystrokes.push('delay 0.5');
+    keystrokes.push('keystroke return');
+
+    const appleScript = `
+tell application "Terminal"
+  activate
+  set frontmost of window id ${sessionData.window_id} to true
+end tell
+
+delay 0.3
+
+tell application "System Events"
+  tell process "Terminal"
+    ${keystrokes.join('\n    ')}
+  end tell
+end tell
+`;
+
+    await fs.writeFile(scriptPath, appleScript);
+    await execAsync(`osascript "${scriptPath}"`);
+
+    // 応答完了を待機
+    const result = await this.waitForResponse(threadTs, sessionData.session_id);
+
+    // 一時ファイルのクリーンアップ
+    try {
+      await fs.unlink(scriptPath);
+    } catch {
+      // 無視
+    }
+
+    if (result.type === 'final') {
+      await this.cleanupTempFiles(threadTs);
+    }
+
+    return result;
   }
 
   private async setCurrentThread(threadTs: string): Promise<void> {
