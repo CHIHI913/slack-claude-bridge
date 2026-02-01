@@ -4,6 +4,8 @@ Slackの1スレッドを1つの会話単位とし、Mac上のClaude Codeの同�
 
 ターミナル上でClaudeとのやり取りが可視化される対話モードを採用。
 
+**選択形式の質問（AskUserQuestion）にも対応** - Claude Codeが選択形式の質問を出した場合、Slackにボタンとして表示され、クリックで回答できます。
+
 ## セットアップ
 
 ### 1. Slack App 作成
@@ -188,6 +190,54 @@ launchctl load ~/Library/LaunchAgents/com.example.slack-claude-bridge.plist
 4. 応答完了後、返信案がスレッドに投稿される
 5. スレッド内で会話を続けると、同じターミナルウィンドウでやり取りが継続
 
+## 選択形式の質問対応（AskUserQuestion）
+
+Claude Codeが選択形式の質問（AskUserQuestion）を出した場合、Slack上でインタラクティブに回答できます。
+
+### 対応する質問形式
+
+| 形式 | Slack上の表示 | 操作方法 |
+|------|---------------|----------|
+| 単一選択 | ボタン形式 | ボタンをクリックで回答 |
+| 複数選択（multiSelect） | ボタン形式 + 選択完了ボタン | 複数のボタンをクリック後「選択完了」 |
+
+### 動作フロー
+
+```
+1. Claude Code が AskUserQuestion を発行
+2. Bridge が JSONLから質問を検出
+3. Slack にボタン付きメッセージを投稿
+4. ユーザーがボタンをクリック
+5. Bridge が AppleScript 経由でキーストロークを送信
+6. Claude Code が回答を受け取り処理続行
+7. 応答が Slack に投稿される
+```
+
+### 単一選択の例
+
+```
+*利用シーン*
+このフローの主な利用シーンはどれですか？
+
+[チームでの飲み会] [クライアントとの会食] [個人利用]
+```
+
+### 複数選択の例
+
+```
+*優先機能*（複数選択可）
+優先したい機能はどれですか？
+
+[✓ 空席検索] [条件検索] [✓ 候補リスト作成] [予約実行]
+
+[選択完了]
+```
+
+### 制限事項
+
+- 「Type something」（自由入力）には対応していません。選択肢のみ回答可能です。
+- 質問のタイムアウトは5分です。5分以内に回答しない場合、質問は破棄されます。
+
 ## ディレクトリ構成
 
 ```
@@ -195,6 +245,7 @@ slack-claude-bridge/
 ├── src/
 │   ├── index.ts           # エントリーポイント
 │   ├── config.ts          # 設定
+│   ├── types.ts           # 型定義（AskUserQuestion関連）
 │   ├── slack-client.ts    # Slack Bot Client
 │   └── claude-executor.ts # Claude Executor + ウィンドウ管理
 ├── scripts/
